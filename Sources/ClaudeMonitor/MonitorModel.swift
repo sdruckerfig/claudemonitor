@@ -101,6 +101,17 @@ final class MonitorModel: ObservableObject {
         onUpdate?()
     }
 
+    #if DEBUG
+    /// Shows `DemoData` instead of live data (for `--render-screenshots`). Don't call `start()` as well.
+    func showDemo(now: Date) {
+        snapshot = DemoData.snapshot(now: now)
+        worktreeScan = DemoData.worktreeScan(now: now)
+        launchAtLogin = true
+        errorText = nil
+        notice = nil
+    }
+    #endif
+
     func toggleExpanded(_ pid: Int32) {
         if expandedSessions.contains(pid) { expandedSessions.remove(pid) } else { expandedSessions.insert(pid) }
     }

@@ -3,6 +3,8 @@ import SwiftUI
 
 struct StatusView: View {
     @ObservedObject var model: MonitorModel
+    /// The popover's height; screenshots use a taller one so every section shows.
+    var height: CGFloat = 640
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -25,7 +27,7 @@ struct StatusView: View {
             Divider()
             footer
         }
-        .frame(width: 480, height: 640)
+        .frame(width: 480, height: height)
     }
 
     // MARK: Header

@@ -37,6 +37,7 @@ func isProcessSerial(_ arg: String) -> Bool {
 
 var modes: [String] = []
 var loginAction = "status"
+var screenshotDirectory = ""   // --render-screenshots (debug builds only)
 do {
     var i = 1
     while i < arguments.count {
@@ -50,6 +51,13 @@ do {
         case "--login-item":
             modes.append(arg)
             if let next, ["on", "off", "status"].contains(next) { loginAction = next; i += 1 }
+        #if DEBUG
+        case "--render-screenshots":
+            guard let next, !next.hasPrefix("-") else { fail("--render-screenshots needs a folder", code: 2) }
+            modes.append(arg)
+            screenshotDirectory = next
+            i += 1
+        #endif
         case _ where isProcessSerial(arg):
             break
         case _ where isSystemSetting(arg):
@@ -118,6 +126,15 @@ case "--login-item"?:
     }
     print("Launch at login: \(describe(service.status))")
     exit(0)
+
+#if DEBUG
+case "--render-screenshots"?:
+    // README screenshots from made-up data: scripts/screenshot.sh.
+    MainActor.assumeIsolated {
+        do { try renderScreenshots(into: URL(fileURLWithPath: screenshotDirectory)) } catch { fail("\(error)") }
+    }
+    exit(0)
+#endif
 
 default:
     break

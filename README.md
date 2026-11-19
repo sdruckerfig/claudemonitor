@@ -8,6 +8,15 @@ A macOS menu bar app that shows:
 
 The menu bar shows a colored dot (the hardware rollup) and the number of Claude sessions. If any session is waiting on you, it also shows `· N⏳`. Click it for details.
 
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/screenshot-dark.png">
+    <img src="docs/screenshot-light.png" width="480" alt="The Claude Monitor popover: a yellow hardware rollup because the CPU is oversubscribed, four Claude sessions (one waiting on you, one busy using two cores, two idle), three reclaimable worktrees totaling 2.2 GB with delete buttons, and the heaviest apps outside Claude.">
+  </picture>
+</p>
+
+<p align="center"><sub>Sample data. The popover scrolls; this screenshot is taller to show every section.</sub></p>
+
 ## Install
 
 Requires macOS 14 (Sonoma) or later on Apple Silicon or Intel.
@@ -58,7 +67,7 @@ These examples use `~/Applications`; if you installed for all users, use `/Appli
 ~/Applications/ClaudeMonitor.app/Contents/MacOS/ClaudeMonitor --help
 ```
 
-**Development:** `swift build`, `scripts/test.sh`, and `scripts/build-app.sh [--universal]`, which builds `build/ClaudeMonitor.app`. The tests use Swift Testing, which needs a Swift 6 toolchain (Command Line Tools 16 or later). `scripts/test.sh` runs `swift test` and, with only the Command Line Tools installed, points the compiler at the Testing macro plugin, which SwiftPM sometimes fails to find.
+**Development:** `swift build`, `scripts/test.sh`, and `scripts/build-app.sh [--universal]`, which builds `build/ClaudeMonitor.app`. The tests use Swift Testing, which needs a Swift 6 toolchain (Command Line Tools 16 or later). `scripts/test.sh` runs `swift test` and, with only the Command Line Tools installed, points the compiler at the Testing macro plugin, which SwiftPM sometimes fails to find. `scripts/screenshot.sh` re-renders the README screenshots from made-up data in `Sources/MonitorCore/DemoData.swift`, never from your own sessions or worktrees.
 
 ## Hardware rollup
 
@@ -119,7 +128,8 @@ The rule settings are in `WorktreePolicy` (`Sources/MonitorCore/Worktrees.swift`
 Sources/MonitorCore/     testable logic: ps parsing, attribution, health rules, worktree rules
 Sources/ClaudeMonitor/   AppKit status item + SwiftUI popover
 Tests/MonitorCoreTests/  swift test (includes end-to-end worktree tests on throwaway repos)
-scripts/                 build-app.sh, make-pkg.sh (+ pkg/postinstall), test.sh
+scripts/                 build-app.sh, make-pkg.sh (+ pkg/postinstall), test.sh, screenshot.sh
+docs/                    README screenshots (rendered from sample data)
 ```
 
 SwiftUI's `@State` and other macros can't be expanded under Command Line Tools, so view state lives in `MonitorModel` as `@Published` properties.
