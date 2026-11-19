@@ -1,8 +1,11 @@
 #!/usr/bin/env bash
-# Builds build/ClaudeMonitor.app (release build, ad-hoc signed).
+# Builds build/ClaudeMonitor.app (release build, hardened runtime).
 #
 #   scripts/build-app.sh               native architecture only (fast)
 #   scripts/build-app.sh --universal   Apple Silicon + Intel (used for the .pkg)
+#
+# Signed ad hoc unless CODESIGN_IDENTITY names a certificate (make-pkg.sh --team sets it to the
+# team's Developer ID Application certificate, with a secure timestamp for notarization).
 #
 # To install, use ./install.sh, which calls this script.
 set -euo pipefail
@@ -28,5 +31,11 @@ cp "$BIN" "$APP/Contents/MacOS/ClaudeMonitor"
 # Drop debug symbols: they hold absolute build paths (the builder's home folder) and aren't needed.
 strip -S "$APP/Contents/MacOS/ClaudeMonitor"
 cp Resources/Info.plist "$APP/Contents/Info.plist"
-codesign --force --sign - "$APP" >/dev/null
+IDENTITY="${CODESIGN_IDENTITY:--}"
+if [[ "$IDENTITY" == "-" ]]; then
+    codesign --force --options runtime --sign - "$APP" >/dev/null
+else
+    codesign --force --options runtime --timestamp --sign "$IDENTITY" "$APP" >/dev/null
+fi
+codesign --verify --strict "$APP"
 echo "Built $APP ($(lipo -archs "$APP/Contents/MacOS/ClaudeMonitor"))"
