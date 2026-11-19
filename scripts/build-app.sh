@@ -25,6 +25,8 @@ APP=build/ClaudeMonitor.app
 rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS"
 cp "$BIN" "$APP/Contents/MacOS/ClaudeMonitor"
+# Drop debug symbols: they hold absolute build paths (the builder's home folder) and aren't needed.
+strip -S "$APP/Contents/MacOS/ClaudeMonitor"
 cp Resources/Info.plist "$APP/Contents/Info.plist"
 codesign --force --sign - "$APP" >/dev/null
 echo "Built $APP ($(lipo -archs "$APP/Contents/MacOS/ClaudeMonitor"))"

@@ -44,7 +44,7 @@ main() {
 
     for dir in "${dirs[@]}"; do
         [[ -d "$dir/$app" ]] || continue
-        # A copy installed by the .pkg is owned by root even when the folder is writable.
+        # A copy the .pkg installed for all users is owned by root even when the folder is writable.
         if ! rm -rf "$dir/$app" 2>/dev/null || [[ -e "$dir/$app" ]]; then
             say "Administrator access is needed to remove $dir/$app"
             sudo rm -rf "$dir/$app"

@@ -28,7 +28,9 @@ Or from a clone: `./install.sh`. Options:
 | `--no-launch` | don't launch after installing |
 | `--ref REF` | branch or tag to build (curl install only) |
 
-**Installer package:** `scripts/make-pkg.sh` builds `dist/ClaudeMonitor-<version>.pkg`, a universal (Apple Silicon + Intel) installer that needs no developer tools on the target Mac. Double-click it and choose "Install for all users" (`/Applications`) or "Install for me only" (`~/Applications`). This repository doesn't publish a built package, so build it on a Mac that has the Command Line Tools. The package is unsigned and the app has only an ad hoc signature; neither is notarized. On a Mac that downloaded the package, macOS blocks the first open until you allow it under System Settings → Privacy & Security → **Open Anyway**.
+**Installer package** (no developer tools needed): download `ClaudeMonitor-<version>.pkg` from the [latest release](https://github.com/sdruckerfig/claudemonitor/releases/latest) and open it. It's universal (Apple Silicon + Intel). Clicking **Install** on the Installation Type step installs for all users into `/Applications` and asks for an administrator password. To install into `~/Applications` instead, click **Change Install Location…** and choose **Install for me only**. Do that if you already installed with the script, so the package replaces that copy instead of adding a second one. You can also build the package yourself with `scripts/make-pkg.sh`.
+
+The package is unsigned and the app has only an ad hoc signature; neither is notarized, so macOS refuses to open the downloaded package the first time. Click **Done** (**OK** on macOS 14), open System Settings → Privacy & Security, scroll down to Security, click **Open Anyway** next to the message about the package, and confirm with your password. Then open the package again. On macOS 14 you can instead Control-click the package and choose **Open**.
 
 Installing a new version, with either the script or the package, starts the new copy, and it quits any older copy that's running. If you have copies in both `~/Applications` and `/Applications`, the one launched last keeps running.
 
@@ -41,6 +43,8 @@ curl -fsSL https://raw.githubusercontent.com/sdruckerfig/claudemonitor/main/unin
 Or `./uninstall.sh`. It quits the app, turns off launch at login, and removes the app from `~/Applications` and `/Applications` along with any installer receipt. If you installed with `--dir DIR`, run `./uninstall.sh --dir DIR`. It never touches your worktrees or sessions.
 
 **Command-line modes** (no UI, one at a time; `--print` and `--worktrees` are read-only, `--login-item on|off` changes the login item). Launch at login is registered by bundle ID, so every installed copy shares it: `--login-item off` from any copy turns it off for all of them.
+
+These examples use `~/Applications`; if you installed for all users, use `/Applications`.
 
 ```sh
 ~/Applications/ClaudeMonitor.app/Contents/MacOS/ClaudeMonitor --print        # one health snapshot

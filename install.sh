@@ -114,7 +114,7 @@ Reinstalling the Command Line Tools usually fixes this: xcode-select --install"
     fi
     dest_dir="$(cd "$dest_dir" && pwd -P)"
     local dest="$dest_dir/$app"
-    # A copy installed by the .pkg is owned by root, even inside a folder you can write to.
+    # A copy the .pkg installed for all users is owned by root, even inside a folder you can write to.
     if [[ -z "$sudo" && -e "$dest" ]]; then
         local foreign
         foreign="$(find "$dest" ! -user "$(id -u)" -print 2>/dev/null | head -1)" || foreign="unknown"
