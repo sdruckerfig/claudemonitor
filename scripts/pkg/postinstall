@@ -1,0 +1,21 @@
+#!/bin/sh
+# Runs after the .pkg payload is installed. $2 is the install location: /Applications, or
+# ~/Applications for "Install for me only". Starts the new Claude Monitor for the logged-in
+# user; on launch it quits any other running copy itself (so nothing is killed from here).
+# Never fails the install: a launch problem is not an installation problem.
+
+app="${2%/}/ClaudeMonitor.app"
+[ -d "$app" ] || app="/Applications/ClaudeMonitor.app"
+[ -d "$app" ] || exit 0
+
+# -n: start the new build even when an older copy from the same path is still running.
+if [ "$(id -u)" = "0" ]; then
+    # System-wide install runs as root: launch in the console user's GUI session.
+    user="$(stat -f%Su /dev/console)"
+    if [ -n "$user" ] && [ "$user" != "root" ] && [ "$user" != "loginwindow" ]; then
+        launchctl asuser "$(id -u "$user")" sudo -u "$user" /usr/bin/open -n "$app" 2>/dev/null || true
+    fi
+else
+    /usr/bin/open -n "$app" 2>/dev/null || true
+fi
+exit 0
