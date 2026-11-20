@@ -261,6 +261,11 @@ struct StatusView: View {
             Toggle("Launch at login", isOn: Binding(get: { model.launchAtLogin },
                                                      set: { model.setLaunchAtLogin($0) }))
                 .toggleStyle(.checkbox).font(.caption)
+            Button("YOLO…") { model.confirmCleanUp() }
+                .controlSize(.small)
+                .disabled(model.snapshot == nil || model.cleaningUp)
+                .help("Clean up everything: stop leftover processes, servers and build daemons, end stale sessions "
+                      + "and delete reclaimable worktrees. Shows what it will do and asks first.")
             Button("Refresh") { model.refresh() }.controlSize(.small)
             Button("Quit") { NSApp.terminate(nil) }.controlSize(.small)
         }

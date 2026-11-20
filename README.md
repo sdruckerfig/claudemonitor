@@ -6,6 +6,7 @@ A macOS menu bar app that shows:
 - **Every running Claude Code session**: status, the CPU and memory used by everything it started, and whether it needs attention.
 - **Leftover servers and build processes**: what closed sessions left running, every dev server listening on a port, and build daemons running on their own, each with a button to stop it.
 - **Reclaimable git worktrees**: worktrees that are safe to delete, how much disk they'd free, and a button to delete them.
+- **YOLO**: one button that cleans up all of the above at once, after showing what it will do.
 
 The menu bar shows a colored dot (the hardware rollup) and the number of Claude sessions. If any session is waiting on you, it also shows `· N⏳`. Click it for details.
 
@@ -138,10 +139,23 @@ The rule settings are in `WorktreePolicy` (`Sources/MonitorCore/Worktrees.swift`
 
 `origin/main` is whatever the last `git fetch` left. The app never fetches. A stale ref only makes it more conservative.
 
+## Clean up everything (YOLO)
+
+**YOLO…** in the footer does every cleanup at once:
+
+- stops everything closed sessions left behind;
+- stops every server and build daemon, including ones a live session or another app may be using;
+- ends stale sessions (idle for 24 h or more) and stops what they started, except anything running inside a `tmux`, interactive shell or app they opened;
+- deletes every reclaimable worktree.
+
+It shows one dialog first: what it will do, which servers may be in use, and about how much memory and disk it frees. Return confirms. None of the safety rules are relaxed. Each process is checked again right before it's signalled, and a stale session is ended only if it's still idle and unchanged since the dialog opened. Every worktree goes through all the checks above, so one that is no longer safe is kept. Afterwards it scans worktrees again, since ending sessions can free more; those are listed, not deleted. You can resume an ended session with `claude --resume`.
+
+The plan is in `Sources/MonitorCore/Cleanup.swift`.
+
 ## Layout
 
 ```
-Sources/MonitorCore/     testable logic: ps parsing, process details (libproc), attribution, leftover and server rules, stopping, health rules, worktree rules
+Sources/MonitorCore/     testable logic: ps parsing, process details (libproc), attribution, leftover and server rules, stopping, the YOLO cleanup plan, health rules, worktree rules
 Sources/ClaudeMonitor/   AppKit status item + SwiftUI popover
 Tests/MonitorCoreTests/  swift test (includes end-to-end worktree tests on throwaway repos)
 scripts/                 build-app.sh, make-pkg.sh (+ pkg/postinstall), test.sh, screenshot.sh

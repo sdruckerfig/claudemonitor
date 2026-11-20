@@ -159,8 +159,16 @@ final class MonitorModel: ObservableObject {
     }
 
     private func delete(_ items: [ReclaimableWorktree]) {
-        deletingWorktrees.formUnion(items.map(\.path))
         worktreeMessage = nil
+        runDelete(items) { msg in
+            self.worktreeMessage = msg
+            self.onUpdate?()
+        }
+    }
+
+    /// Removes each worktree on the worktree queue; `done` gets the outcome on the main queue.
+    private func runDelete(_ items: [ReclaimableWorktree], done: @escaping (String) -> Void) {
+        deletingWorktrees.formUnion(items.map(\.path))
         let scanner = scanner
         // Same serial queue as scans, but the user is waiting: don't run git throttled.
         // .enforceQoS: without it the queue's background QoS wins over the block's.
@@ -186,8 +194,7 @@ final class MonitorModel: ObservableObject {
                 var msg = removed.isEmpty ? "" : "Deleted \(removed.count) worktree(s), about \(Format.bytes(freed)) freed."
                 if let note = WorktreeScanner.savedSummary(savedMessages) { msg += " " + note }
                 if !failures.isEmpty { msg += (msg.isEmpty ? "" : " ") + failures.joined(separator: "; ") }
-                self.worktreeMessage = msg
-                self.onUpdate?()
+                done(msg)
             }
         }
     }
@@ -319,12 +326,26 @@ final class MonitorModel: ObservableObject {
     }
 
     private func stop(_ jobs: [ProcessJob], takenAt: Date, signal: Int32) {
+        runStop(jobs, takenAt: takenAt, signal: signal) { notice in
+            self.notice = notice
+            self.refresh()
+        }
+    }
+
+    /// Stops the jobs on the sampler queue; `done` gets the outcome on the main queue.
+    private func runStop(_ jobs: [ProcessJob], takenAt: Date, signal: Int32, done: @escaping (String?) -> Void) {
         let roots = Set(jobs.map(\.id))
         stoppingJobs.formUnion(roots)
         let monitor = monitor
         let queue = queue
         let what = jobs.count == 1 ? jobs[0].title : "\(jobs.count) process groups"
         let members = jobs.flatMap(\.members)
+        let finish = { (notice: String?) in
+            DispatchQueue.main.async {
+                self.stoppingJobs.subtract(roots)
+                done(notice)
+            }
+        }
         // The sampler's queue: `Monitor` is used from that one queue. The user is waiting, so
         // don't run throttled (.enforceQoS: otherwise the queue's utility QoS wins).
         queue.async(qos: .userInitiated, flags: .enforceQoS) {
@@ -335,22 +356,99 @@ final class MonitorModel: ObservableObject {
                 let plan = ProcessStopper.plan(members: members, takenAt: takenAt, fresh: fresh, freshTakenAt: freshAt)
                 outcome = ProcessStopper.send(signal, to: plan, takenAt: freshAt)
             } catch {
-                DispatchQueue.main.async { self.finishStop(roots, notice: "Could not stop \(what): \(error)") }
+                finish("Could not stop \(what): \(error)")
                 return
             }
             // Give them a moment to exit, then see what's left.
             queue.asyncAfter(deadline: .now() + (outcome.signalled.isEmpty ? 0 : 2)) {
                 let left = ProcessStopper.stillRunning(outcome.signalled, takenAt: freshAt)
-                let notice = Self.stopNotice(what: what, signal: signal, outcome: outcome, stillRunning: left)
-                DispatchQueue.main.async { self.finishStop(roots, notice: notice) }
+                finish(Self.stopNotice(what: what, signal: signal, outcome: outcome, stillRunning: left))
             }
         }
     }
 
-    private func finishStop(_ roots: Set<Int32>, notice: String?) {
-        stoppingJobs.subtract(roots)
-        self.notice = notice
+    // MARK: Clean up everything (YOLO)
+
+    @Published private(set) var cleaningUp = false
+    /// Steps still running, and each finished step's outcome by its order in the summary.
+    private var cleanupPending = 0
+    private var cleanupResults: [Int: String] = [:]
+
+    /// Plans from what's on screen, asks once, then stops, ends and deletes it all.
+    func confirmCleanUp() {
+        guard let snap = snapshot, !cleaningUp else { return }
+        let items = (worktreeScan?.reclaimable ?? []).filter { !deletingWorktrees.contains($0.path) }
+        let plan = CleanupPlan(snapshot: snap, worktrees: items, skipping: stoppingJobs)
+        guard !plan.isEmpty else {
+            notice = "Nothing to clean up: no leftover processes, servers, build daemons, stale sessions or reclaimable worktrees."
+            onUpdate?()
+            return
+        }
+        let alert = NSAlert()
+        alert.messageText = "Clean up everything?"
+        alert.informativeText = plan.summary.joined(separator: "\n")
+        alert.alertStyle = .warning
+        alert.addButton(withTitle: "Clean Up")
+        alert.addButton(withTitle: "Cancel")
+        NSApp.activate(ignoringOtherApps: true)
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        cleanUp(plan)
+    }
+
+    private func cleanUp(_ plan: CleanupPlan) {
+        cleaningUp = true
+        notice = nil
+        cleanupResults = [:]
+        // Every step, synchronous or not, finishes through finishCleanupStep.
+        cleanupPending = 1 + (plan.jobs.isEmpty ? 0 : 1) + (plan.worktrees.isEmpty ? 0 : 1)
+        if !plan.jobs.isEmpty {
+            runStop(plan.jobs, takenAt: plan.takenAt, signal: SIGTERM) { self.finishCleanupStep(1, $0) }
+        }
+        if !plan.worktrees.isEmpty {
+            runDelete(plan.worktrees) { self.finishCleanupStep(2, $0) }
+        }
+        finishCleanupStep(0, endStaleSessions(plan.staleSessions, takenAt: plan.takenAt))
+    }
+
+    private func finishCleanupStep(_ order: Int, _ outcome: String?) {
+        if let outcome, !outcome.isEmpty { cleanupResults[order] = outcome }
+        cleanupPending -= 1
+        guard cleanupPending == 0 else { return }
+        cleaningUp = false
+        notice = cleanupResults.sorted { $0.key < $1.key }.map(\.value).joined(separator: " ")
+        cleanupResults = [:]
         refresh()
+        // Ending sessions and stopping processes can free more worktrees: show them (not delete).
+        scanWorktrees()
+    }
+
+    /// SIGTERM to each stale session's claude, if it is still that process and its session is
+    /// still idle and unchanged since the plan was made (not used while the dialog was open).
+    private func endStaleSessions(_ sessions: [SessionUsage], takenAt: Date) -> String? {
+        guard !sessions.isEmpty else { return nil }
+        let records = SessionFiles.load()
+        var ended = 0
+        var resumed: [String] = []
+        var failed: [String] = []
+        for u in sessions {
+            guard ProcessIdentity.isSameProcess(u.process, takenAt: takenAt),
+                  let r = records.first(where: { $0.pid == u.process.pid && $0.sessionId == u.record.sessionId })
+            else { continue }   // already ended
+            guard r.status == .idle, r.statusUpdatedAt == u.record.statusUpdatedAt else {
+                resumed.append("“\(u.record.name)”")
+                continue
+            }
+            if kill(u.process.pid, SIGTERM) == 0 {
+                ended += 1
+            } else {
+                failed.append("“\(u.record.name)” (\(String(cString: strerror(errno))))")
+            }
+        }
+        var parts: [String] = []
+        if ended > 0 { parts.append("Ended \(ended == 1 ? "1 stale session" : "\(ended) stale sessions").") }
+        if !resumed.isEmpty { parts.append("Left \(resumed.joined(separator: ", ")) running: used while the dialog was open.") }
+        if !failed.isEmpty { parts.append("Could not end \(failed.joined(separator: ", ")).") }
+        return parts.joined(separator: " ")
     }
 
     nonisolated static func stopNotice(what: String, signal: Int32, outcome: ProcessStopper.Outcome,
