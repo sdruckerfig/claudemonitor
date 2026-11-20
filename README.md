@@ -21,8 +21,6 @@ The menu bar shows a colored dot (the hardware rollup) and the number of Claude 
 
 Requires macOS 14 (Sonoma) or later on Apple Silicon or Intel.
 
-**[⬇ Download the installer: ClaudeMonitor-0.1.1.pkg](https://github.com/sdruckerfig/claudemonitor/releases/download/v0.1.1/ClaudeMonitor-0.1.1.pkg)** (no developer tools needed; see [Installer package](#installer-package) below, or [all releases](https://github.com/sdruckerfig/claudemonitor/releases)).
-
 **One-line install** (builds from source; needs Apple's Command Line Tools, `xcode-select --install`, but not Xcode):
 
 ```sh
@@ -39,13 +37,9 @@ Or from a clone: `./install.sh`. Options:
 | `--no-launch` | don't launch after installing |
 | `--ref REF` | branch or tag to build (curl install only) |
 
-<a id="installer-package"></a>**Installer package** (no developer tools needed): [download ClaudeMonitor-0.1.1.pkg](https://github.com/sdruckerfig/claudemonitor/releases/download/v0.1.1/ClaudeMonitor-0.1.1.pkg) (or the newest from the [latest release](https://github.com/sdruckerfig/claudemonitor/releases/latest)) and open it. It's universal (Apple Silicon + Intel) and signed with a Developer ID. Clicking **Install** on the Installation Type step installs for all users into `/Applications` and asks for an administrator password. To install into `~/Applications` instead, click **Change Install Location…** and choose **Install for me only**. Do that if you already installed with the script, so the package replaces that copy instead of adding a second one.
+To build an installer package yourself, run `scripts/make-pkg.sh` (see the script's header for signing and notarizing options).
 
-The package isn't notarized yet, so macOS refuses to open the downloaded package the first time. Click **Done** (**OK** on macOS 14), open System Settings → Privacy & Security, scroll down to Security, click **Open Anyway** next to the message about the package, and confirm with your password. Then open the package again. On macOS 14 you can instead Control-click the package and choose **Open**.
-
-To build the package yourself, run `scripts/make-pkg.sh`. Without options it's unsigned. With your own Developer ID certificates, `--team TEAMID` signs it, and `--team TEAMID --notarize PROFILE` also notarizes and staples it, so macOS opens a downloaded copy without the Open Anyway step (see the script's header).
-
-Installing a new version, with either the script or the package, starts the new copy, and it quits any older copy that's running. If you have copies in both `~/Applications` and `/Applications`, the one launched last keeps running.
+Installing a new version starts the new copy, and it quits any older copy that's running. If you have copies in both `~/Applications` and `/Applications`, the one launched last keeps running.
 
 **Uninstall:**
 
