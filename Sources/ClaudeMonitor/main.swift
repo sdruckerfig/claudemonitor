@@ -11,6 +11,8 @@ let usage = """
 usage: ClaudeMonitor                              run the menu bar app
        ClaudeMonitor --print                      print one health snapshot and exit
        ClaudeMonitor --worktrees                  list reclaimable worktrees and exit (never deletes)
+       ClaudeMonitor --pool-status                show this repository's warm worktree pool
+       ClaudeMonitor --pool-run BRANCH -- CMD ... run a command in a bounded, reusable worktree
        ClaudeMonitor --login-item [on|off|status] manage launch at login (run from inside the .app)
        ClaudeMonitor --version
        ClaudeMonitor --help
@@ -38,14 +40,24 @@ func isProcessSerial(_ arg: String) -> Bool {
 var modes: [String] = []
 var loginAction = "status"
 var screenshotDirectory = ""   // --render-screenshots (debug builds only)
+var poolBranch = ""
+var poolCommand: [String] = []
 do {
     var i = 1
     while i < arguments.count {
         let arg = arguments[i]
         let next = arguments.indices.contains(i + 1) ? arguments[i + 1] : nil
         switch arg {
-        case "--print", "--worktrees", "--version":
+        case "--print", "--worktrees", "--version", "--pool-status":
             modes.append(arg)
+        case "--pool-run":
+            guard let next, arguments.count > i + 3, arguments[i + 2] == "--" else {
+                fail("--pool-run needs BRANCH -- CMD [ARGS...]\n\(usage)", code: 2)
+            }
+            modes.append(arg)
+            poolBranch = next
+            poolCommand = Array(arguments.dropFirst(i + 3))
+            i = arguments.count
         case "--help", "-h":
             modes.append("--help")
         case "--login-item":
@@ -100,6 +112,27 @@ case "--worktrees"?:
     // Lists reclaimable worktrees; never deletes.
     print(TextReport.render(WorktreeScanner().scan()))
     exit(0)
+
+case "--pool-status"?:
+    do { print(try WorktreePool(in: FileManager.default.currentDirectoryPath).status()) }
+    catch { fail("\(error)") }
+    exit(0)
+
+case "--pool-run"?:
+    do {
+        let pool = try WorktreePool(in: FileManager.default.currentDirectoryPath)
+        let path = try pool.acquire(branch: poolBranch)
+        guard chdir(path) == 0 else { fail("cannot enter \(path)") }
+        FileHandle.standardError.write(Data("claudemonitor: \(poolBranch) in \(path)\n".utf8))
+        // exec preserves the terminal, signals, exit status and lease PID. No shell
+        // interpolation: arguments after -- reach the command exactly as supplied.
+        let argv = poolCommand.map { strdup($0) } + [nil]
+        defer { for pointer in argv { free(pointer) } }
+        argv.withUnsafeBufferPointer { buffer in
+            _ = execvp(poolCommand[0], UnsafeMutablePointer(mutating: buffer.baseAddress!))
+        }
+        fail("cannot execute \(poolCommand[0]): \(String(cString: strerror(errno)))")
+    } catch { fail("\(error)") }
 
 case "--login-item"?:
     // Must be run from inside the installed .app bundle; used by install.sh and uninstall.sh.

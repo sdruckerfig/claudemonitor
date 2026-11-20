@@ -6,6 +6,10 @@ A macOS menu bar app that shows:
 - **Every running Claude Code session**: status, the CPU and memory used by everything it started, and whether it needs attention.
 - **Reclaimable git worktrees**: worktrees that are safe to delete, how much disk they'd free, and a button to delete them.
 
+An optional [command-line runner](#preventing-worktree-sprawl) also prevents new
+worktree sprawl: run tasks in a bounded pool of reusable checkouts that keep
+their build caches, and resume unfinished work before starting more.
+
 The menu bar shows a colored dot (the hardware rollup) and the number of Claude sessions. If any session is waiting on you, it also shows `· N⏳`. Click it for details.
 
 <p align="center">
@@ -94,6 +98,73 @@ Sessions are read from `~/.claude/sessions/<pid>.json`. This is an internal Clau
 Right-click a session to reveal its folder, copy its PID, copy a `claude --resume` command, or end it (SIGTERM, with confirmation).
 
 ## Reclaimable worktrees
+
+### Preventing worktree sprawl
+
+The optional **warm worktree pool** bounds how much unfinished work you start,
+instead of creating a new checkout and installing dependencies for every task.
+From a repository, run:
+
+```sh
+~/Applications/ClaudeMonitor.app/Contents/MacOS/ClaudeMonitor --pool-run fix/login -- claude
+~/Applications/ClaudeMonitor.app/Contents/MacOS/ClaudeMonitor --pool-status
+```
+
+The first command creates or reuses one of **two slots per repository**, beside
+the main checkout in `<repo>-claudemonitor-pool/slot-N`. It runs the command there
+with your terminal, arguments, signals and exit status intact. Any foreground
+command works, so you can run a shell or a test command instead of `claude`.
+Run the same branch again to resume its slot, including uncommitted work.
+Use a foreground command: a launcher that exits after opening another terminal
+cannot represent that terminal's lifetime.
+
+When every slot is running or holds unfinished work, the command stops and names
+what keeps each slot occupied. It never creates an overflow worktree. Finish or
+resume an existing task before starting another; `--pool-status` shows the
+branches and paths. Slots are leased to the command's PID **and start time**, so
+a crashed command does not leave a permanent lease and a recycled PID does not
+inherit one. Concurrent allocation is protected by a kernel file lock.
+
+**Exiting Claude does not mean the work is finished.** Before switching a slot
+to another branch, the pool applies the same conservative safety checks as the
+cleanup scanner, without the 24-hour idle delay: no live user, edits (including
+hidden edits), unique local files, paused git operation, or unmerged work. A slot
+with unfinished work stays on its branch until you explicitly resume and finish
+it. After merging, fetch origin in the main checkout before reusing the slot;
+the pool never fetches for you. Squash merges may need manual reconciliation, as
+described below. Main checkouts and other worktrees are never taken over.
+
+The slot's build output and dependency caches survive reuse. Branches and
+reflogs are kept; there is no force checkout or automatic deletion. The pool
+locks its worktrees in git, so the monitor and `git worktree prune` leave them
+alone. Refresh dependencies when switching between branches with different
+lockfiles: a warm cache does not guarantee it matches the next branch. The
+checkout refuses to overwrite ignored files that the next branch tracks.
+
+Set an explicit capacity for your machine, rather than increasing it whenever
+work queues up:
+
+```sh
+git config claudemonitor.poolSize 3  # 1–32; default 2
+```
+
+The limit covers commands launched through this runner in this repository.
+Claude-created subagent worktrees and commands started elsewhere are outside
+it; this is not a machine-wide CPU scheduler. Lowering the size leaves existing
+slots and their work intact; resume branches in excluded slots from their paths.
+No hooks or Claude settings are installed or changed.
+
+To make the limit useful, give each branch a shippable outcome, finish the change
+and run its focused tests before an expensive full suite. Batch independent
+fixes when they can share validation and their results remain separately
+verifiable. Keep fixes as separate commits for targeted reverts. Avoid leaving
+slots occupied by a growing collection of half-finished tasks.
+
+To stop using the pool, launch Claude normally. To retire its slots, first finish
+or save their work, then explicitly unlock and remove each worktree with git.
+The regular uninstaller leaves them alone, just like other worktrees.
+
+### Finding existing worktrees to reclaim
 
 20 seconds after launch, then every 30 minutes (and when you click **Scan Now**), it looks for git repos up to two levels below `~`, plus the main repos of any linked worktrees it finds there. It skips hidden folders and `Library`, `Applications`, `Movies`, `Music`, `Pictures`, `Downloads`, `Dropbox` and `node_modules`. It then checks each *linked* worktree. Main checkouts are never candidates.
 
