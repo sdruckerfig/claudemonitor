@@ -20,9 +20,21 @@ elif [[ -n "${1:-}" ]]; then
     exit 2
 fi
 
-# "${ARCH_FLAGS[@]+...}" keeps `set -u` happy when the array is empty (bash 3.2).
-swift build -c release --product ClaudeMonitor ${ARCH_FLAGS[@]+"${ARCH_FLAGS[@]}"}
-BIN="$(swift build -c release ${ARCH_FLAGS[@]+"${ARCH_FLAGS[@]}"} --show-bin-path)/ClaudeMonitor"
+# On some Macs, Swift 6.4's default build system (Swift Build) stops before compiling anything
+# with "Could not initialize build system … Unknown error parsing property list". The older
+# native build system still works there, so retry with it after that error, and only then:
+# --build-system native is deprecated, so it isn't the default.
+# "${ARRAY[@]+...}" keeps `set -u` happy when an array is empty (bash 3.2).
+BUILD_FLAGS=(-c release ${ARCH_FLAGS[@]+"${ARCH_FLAGS[@]}"})
+LOG="$(mktemp -t claudemonitor-build)"
+trap 'rm -f "$LOG"' EXIT
+if ! swift build "${BUILD_FLAGS[@]}" --product ClaudeMonitor 2>&1 | tee "$LOG"; then
+    grep -q 'Could not initialize build system' "$LOG" || exit 1
+    echo "The default build system failed to start; retrying with --build-system native." >&2
+    BUILD_FLAGS+=(--build-system native)
+    swift build "${BUILD_FLAGS[@]}" --product ClaudeMonitor
+fi
+BIN="$(swift build "${BUILD_FLAGS[@]}" --show-bin-path)/ClaudeMonitor"
 
 APP=build/ClaudeMonitor.app
 rm -rf "$APP"
