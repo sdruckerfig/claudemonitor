@@ -4,11 +4,20 @@ import Foundation
 public enum WorktreeError: Error, CustomStringConvertible {
     case noLongerSafe(String, String)
     case gitFailed(String)
+    /// `git worktree remove` deleted the worktree's git directory, then failed: what it couldn't
+    /// delete is still on disk. `saved`: messages saved first whose originals git deleted.
+    case partlyRemoved(path: String, git: String, saved: [String])
 
     public var description: String {
         switch self {
         case .noLongerSafe(let path, let why): return "\((path as NSString).lastPathComponent) was kept: \(why)"
         case .gitFailed(let msg): return msg
+        case .partlyRemoved(let path, let git, let saved):
+            let name = (path as NSString).lastPathComponent
+            var text = "git stopped partway through deleting \(name) (\(git)). It is no longer a worktree; "
+                + "the files git couldn't delete are still in \(Format.path(path))."
+            if let note = WorktreeScanner.savedSummary(saved) { text += " " + note }
+            return text
         }
     }
 }
@@ -27,6 +36,10 @@ public final class WorktreeScanner: @unchecked Sendable {
     /// lstat keys of the files and folders the last classify() looked at, so remove() can tell
     /// whether anything in the worktree changed between checking and deleting.
     private var lastFileSnapshot: [String: String] = [:]
+    /// Reads what is running. A property so tests can make it fail.
+    var captureContext: () throws -> LiveContext = LiveContext.capture
+    /// Tests only: runs right after `git status` in classify(), to land a write inside the checks.
+    var afterStatus: (() -> Void)?
 
     public init(policy: WorktreePolicy = WorktreePolicy()) {
         self.policy = policy
@@ -34,7 +47,7 @@ public final class WorktreeScanner: @unchecked Sendable {
 
     public func scan(now: Date = Date()) -> WorktreeScan {
         let started = Date()
-        let context = LiveContext.capture()
+        let context = Result { try captureContext() }
         let registered = registeredWorktrees()
         let allPaths = Self.allPaths(registered)
         var skipped: [String: Int] = [:]
@@ -45,8 +58,15 @@ public final class WorktreeScanner: @unchecked Sendable {
             let base = baseRef(in: repo)
             for wt in worktrees where !wt.isMain {
                 total += 1
-                let (verdict, activity) = classify(wt, repo: repo, base: base?.ref, baseSHA: base?.sha, context: context,
+                let (verdict, activity): (WorktreeVerdict, Date?)
+                switch context {
+                case .success(let context):
+                    (verdict, activity) = classify(wt, repo: repo, base: base?.ref, baseSHA: base?.sha, context: context,
                                                    allWorktreePaths: allPaths, now: now)
+                case .failure(let error):
+                    // Without the list, nothing could be shown to be unused.
+                    (verdict, activity) = (.failed("running processes can't be listed: \(error)"), nil)
+                }
                 guard verdict == .reclaimable, let base = base?.ref else {
                     skipped[verdict.category, default: 0] += 1
                     continue
@@ -78,17 +98,17 @@ public final class WorktreeScanner: @unchecked Sendable {
         guard let wt = registered.first(where: { $0.repo == item.repo })?.worktrees.first(where: { $0.path == item.path }) else {
             throw WorktreeError.noLongerSafe(item.path, "git no longer lists it")
         }
-        guard let before = Self.fingerprint(wt.path) else {
+        guard let before = Self.fingerprint(wt.path), let gitdir = Self.gitdir(of: wt.path) else {
             throw WorktreeError.noLongerSafe(item.path, "its git metadata can't be read")
         }
-        let (verdict, _) = classify(wt, repo: item.repo, base: item.baseRef, context: LiveContext.capture(),
+        let (verdict, _) = classify(wt, repo: item.repo, base: item.baseRef, context: try liveContext(item.path),
                                     allWorktreePaths: Self.allPaths(registered), now: now)
         guard verdict == .reclaimable else { throw WorktreeError.noLongerSafe(item.path, verdict.explanation) }
         let files = lastFileSnapshot
         // The checks take a while. Right before deleting, make sure nothing started using the
         // worktree and nothing moved its HEAD, reflog, index or refs in the meantime (git
         // worktree remove refuses edited files, but not new commits).
-        let last = LiveContext.capture()
+        let last = try liveContext(item.path)
         for path in Set([Self.realPath(wt.path), wt.path]) {
             if let why = Worktrees.usage(of: path, processes: last.processes, cwds: last.cwds, sessions: last.sessions) {
                 throw WorktreeError.noLongerSafe(item.path, why)
@@ -98,25 +118,58 @@ public final class WorktreeScanner: @unchecked Sendable {
               files.allSatisfy({ Self.statKey($0.key) == $0.value }) else {
             throw WorktreeError.noLongerSafe(item.path, "it changed while it was being checked")
         }
-        let saved = try saveUnsentMessages(worktree: wt.path, repo: item.repo)
+        let saved = try saveUnsentMessages(gitdir: gitdir, worktree: wt.path, repo: item.repo)
         let result = Self.git(["worktree", "remove", item.path], in: item.repo)
         guard result.status == 0 else {
-            for file in saved { try? FileManager.default.removeItem(atPath: file) }   // still in the worktree
-            throw WorktreeError.gitFailed(result.err.trimmingCharacters(in: .whitespacesAndNewlines))
+            let message = result.err.trimmingCharacters(in: .whitespacesAndNewlines)
+            let kept = Self.discardRedundantCopies(saved)
+            // Once git starts deleting it carries on: a file it can't delete doesn't stop it from
+            // deleting the git directory (and the messages in it) and unregistering the worktree.
+            if !Self.exists(gitdir) { throw WorktreeError.partlyRemoved(path: item.path, git: message, saved: kept) }
+            throw WorktreeError.gitFailed(([message] + [Self.savedSummary(kept)].compactMap { $0 }).joined(separator: " "))
         }
-        return saved
+        return saved.map(\.copy)
     }
 
-    /// The worktree's git directory can hold a commit message that was never used: COMMIT_EDITMSG
-    /// after a commit a hook rejected (or that had nothing to commit), MERGE_MSG, SQUASH_MSG.
+    private func liveContext(_ path: String) throws -> LiveContext {
+        do { return try captureContext() } catch {
+            throw WorktreeError.noLongerSafe(path, "running processes can't be listed (\(error))")
+        }
+    }
+
+    /// "Saved N unsent message(s) to <folder>.", or nil for none.
+    public static func savedSummary(_ files: [String]) -> String? {
+        guard let folder = files.first.map({ ($0 as NSString).deletingLastPathComponent }) else { return nil }
+        return "Saved \(files.count) unsent message(s) to \(Format.path(folder))."
+    }
+
+    struct SavedMessage {
+        let copy: String
+        let original: String
+    }
+
+    /// After a failed removal: deletes each copy whose original is still in the worktree's git
+    /// directory, and returns the rest (git deleted those originals before it failed).
+    static func discardRedundantCopies(_ saved: [SavedMessage]) -> [String] {
+        var kept: [String] = []
+        for message in saved {
+            if exists(message.original) {
+                try? FileManager.default.removeItem(atPath: message.copy)
+            } else {
+                kept.append(message.copy)
+            }
+        }
+        return kept
+    }
+
+    /// The worktree's git directory can hold a message that was never used: COMMIT_EDITMSG after
+    /// a commit a hook rejected (or that had nothing to commit), MERGE_MSG, SQUASH_MSG, and
+    /// TAG_EDITMSG or NOTES_EDITMSG, which git leaves when it can't create the tag or note.
     /// Removal deletes them, so each one that isn't the message of a recent commit is copied to
     /// `policy.savedMessagesDirectory` first. Throws when one can't be read or saved.
-    private func saveUnsentMessages(worktree: String, repo: String) throws -> [String] {
-        guard let gitdir = Self.gitdir(of: worktree) else {
-            throw WorktreeError.noLongerSafe(worktree, "its git metadata can't be read")
-        }
+    private func saveUnsentMessages(gitdir: String, worktree: String, repo: String) throws -> [SavedMessage] {
         var drafts: [(name: String, text: String)] = []
-        for name in ["COMMIT_EDITMSG", "MERGE_MSG", "SQUASH_MSG"] where Self.exists(gitdir + "/" + name) {
+        for name in ["COMMIT_EDITMSG", "MERGE_MSG", "SQUASH_MSG", "TAG_EDITMSG", "NOTES_EDITMSG"] where Self.exists(gitdir + "/" + name) {
             guard let data = FileManager.default.contents(atPath: gitdir + "/" + name) else {
                 throw WorktreeError.noLongerSafe(worktree, "its \(name) can't be read")
             }
@@ -133,16 +186,16 @@ public final class WorktreeScanner: @unchecked Sendable {
             return f.string(from: Date())
         }()
         let folder = policy.savedMessagesDirectory + "/" + (repo as NSString).lastPathComponent
-        var saved: [String] = []
+        var saved: [SavedMessage] = []
         do {
             for draft in drafts where !used.contains(Self.messageBody(draft.text)) {
                 try FileManager.default.createDirectory(atPath: folder, withIntermediateDirectories: true)
                 let file = folder + "/\((worktree as NSString).lastPathComponent) \(stamp) \(draft.name).txt"
                 try Data(draft.text.utf8).write(to: URL(fileURLWithPath: file), options: .withoutOverwriting)
-                saved.append(file)
+                saved.append(SavedMessage(copy: file, original: gitdir + "/" + draft.name))
             }
         } catch {
-            for file in saved { try? FileManager.default.removeItem(atPath: file) }
+            for message in saved { try? FileManager.default.removeItem(atPath: message.copy) }
             throw WorktreeError.noLongerSafe(worktree, "its unsent commit message couldn't be saved: \(error.localizedDescription)")
         }
         return saved
@@ -188,8 +241,9 @@ public final class WorktreeScanner: @unchecked Sendable {
             return (.recentlyActive, activity)
         }
         guard let gitdir = Self.gitdir(of: wt.path) else { return (.failed("can't read its .git file"), activity) }
-        // A paused rebase, am, merge, cherry-pick, revert or bisect keeps its state (patches,
-        // todo lists, good/bad verdicts) in the worktree's gitdir, and git status shows nothing.
+        // A paused rebase, am, merge, cherry-pick, revert, bisect or notes merge keeps its state
+        // (patches, todo lists, good/bad verdicts, conflict resolutions) in the worktree's gitdir,
+        // and git status shows nothing.
         if let op = Self.operationInProgress(gitdir: gitdir) { return (.operationInProgress(op), activity) }
         // Submodules initialised in this worktree keep their own repositories in <gitdir>/modules.
         if Self.exists(gitdir + "/modules") { return (.submodules, activity) }
@@ -224,6 +278,7 @@ public final class WorktreeScanner: @unchecked Sendable {
                                "status", "--porcelain=v1", "-z",
                                "--untracked-files=normal", "--ignored=matching", "--ignore-submodules=none"], in: wt.path)
         guard status.status == 0 else { return (.failed(status.err), activity) }
+        afterStatus?()
         let parsed = Worktrees.parseStatus(status.out)
         if !parsed.changes.isEmpty { return (.dirty, activity) }
 
@@ -239,7 +294,8 @@ public final class WorktreeScanner: @unchecked Sendable {
         }
         if !filtered.isEmpty { return (.hiddenChanges(filtered), activity) }
 
-        let (fileVerdict, snapshot) = checkFiles(ignored: parsed.ignored, worktree: wt.path, mainCheckout: repo)
+        let (fileVerdict, snapshot) = checkFiles(ignored: parsed.ignored, tracked: index.map(\.path),
+                                                 worktree: wt.path, mainCheckout: repo)
         if let fileVerdict { return (fileVerdict, activity) }
         lastFileSnapshot = snapshot
         return (.reclaimable, activity)
@@ -366,6 +422,8 @@ public final class WorktreeScanner: @unchecked Sendable {
     /// - Ignored files need a byte-identical copy (for a symlink, the same target) really inside the
     ///   main checkout. Files in an ignored folder count the same way, unless the folder is
     ///   regenerable: a dependency or cache folder, or a build-output folder the main checkout also has.
+    ///   So does any other file that isn't tracked: git status didn't list it, so it appeared after
+    ///   status ran (the snapshot of its folder, taken during this walk, would already include it).
     ///   Finder's metadata files (.DS_Store, ._*, Icon\r) are disposable.
     /// - Nothing named .git (any case) may exist below the root. Git skips such entries without a
     ///   word unless they hold a valid repository, so status can't be trusted to report them. The
@@ -373,7 +431,12 @@ public final class WorktreeScanner: @unchecked Sendable {
     ///   (SwiftPM keeps every dependency as a clone in .build/checkouts).
     /// Walks the whole worktree once and returns, with any verdict, lstat keys of every folder and
     /// compared file, for remove() to re-check right before deleting.
-    private func checkFiles(ignored: [String], worktree: String, mainCheckout: String) -> (WorktreeVerdict?, [String: String]) {
+    private func checkFiles(ignored: [String], tracked: [String], worktree: String,
+                            mainCheckout: String) -> (WorktreeVerdict?, [String: String]) {
+        // Tracked files (git status found them unchanged, and git worktree remove checks them
+        // again) and the ignored files compared below. Swift compares strings by canonical
+        // equivalence, so a name stored decomposed on disk still matches git's precomposed one.
+        let vouched = Set(tracked).union(ignored.filter { $0.utf8.last != UInt8(ascii: "/") })
         var unique: [String] = []
         var budget = policy.maxIgnoredFilesToVerify
         var nestedBudget = policy.maxNestedRepositories
@@ -436,8 +499,10 @@ public final class WorktreeScanner: @unchecked Sendable {
                 snapshot[url.path] = Self.statKey(url.path)   // a new entry anywhere changes its folder
                 continue
             }
-            // Inside an ignored folder that isn't regenerable: needs a copy like any ignored file.
-            guard enclosing == false else { continue }
+            if enclosing == true { continue }                        // regenerable folder
+            if enclosing == nil && vouched.contains(rel) { continue }
+            // Inside an ignored folder that isn't regenerable, or a file git status never listed:
+            // needs a copy like any ignored file.
             if let verdict = compare(rel, at: url.path) { return (verdict, snapshot) }
         }
         if unreadable { return (.failed("cannot read everything in the worktree"), snapshot) }
@@ -593,6 +658,9 @@ public final class WorktreeScanner: @unchecked Sendable {
             ("rebase-merge", "a rebase"), ("rebase-apply", "a rebase or git am"), ("MERGE_HEAD", "a merge"),
             ("CHERRY_PICK_HEAD", "a cherry-pick"), ("REVERT_HEAD", "a revert"), ("sequencer", "a cherry-pick or revert"),
             ("BISECT_LOG", "a bisect"), ("BISECT_START", "a bisect"),
+            // git notes merge: conflict resolutions in progress, and the partial merge commit.
+            ("NOTES_MERGE_WORKTREE", "a notes merge"), ("NOTES_MERGE_PARTIAL", "a notes merge"),
+            ("NOTES_MERGE_REF", "a notes merge"),
         ]
         return markers.first { exists(gitdir + "/" + $0.0) }.map { "\($0.1) is in progress" }
     }
@@ -775,22 +843,39 @@ struct LiveContext {
     let cwds: [Int32: String]
     let sessions: [SessionRecord]
 
-    static func capture() -> LiveContext {
-        let main = (try? Monitor.ps(ProcessTable.mainArguments)).map(ProcessTable.parseMain) ?? [:]
-        let processes = ProcessTable.merge(main: main, comm: [:])
-        let live = Set(processes.map(\.pid))
-        let sessions = SessionFiles.load().filter { live.contains($0.pid) }
-        return LiveContext(processes: processes, cwds: ProcessCwd.all(), sessions: sessions)
+    struct Unavailable: Error, CustomStringConvertible {
+        let description: String
+    }
+
+    /// Throws rather than return a partial picture: with no processes listed, every "in use"
+    /// check would pass.
+    static func capture() throws -> LiveContext {
+        try make(ps: Monitor.ps(ProcessTable.mainArguments), cwds: ProcessCwd.all(), sessions: SessionFiles.load())
+    }
+
+    static func make(ps: String, cwds: [Int32: String]?, sessions: [SessionRecord],
+                     selfPid: Int32 = getpid()) throws -> LiveContext {
+        let main = ProcessTable.parseMain(ps)
+        // Both lists always include the process asking. Without it, neither is a real list.
+        guard main[selfPid] != nil else { throw Unavailable(description: "ps listed no processes") }
+        guard let cwds, cwds[selfPid] != nil else {
+            throw Unavailable(description: "their working folders can't be read")
+        }
+        let live = Set(main.keys)
+        return LiveContext(processes: ProcessTable.merge(main: main, comm: [:]), cwds: cwds,
+                           sessions: sessions.filter { live.contains($0.pid) })
     }
 }
 
 public enum ProcessCwd {
-    /// Working directory of every process this user can inspect (via libproc).
-    public static func all() -> [Int32: String] {
+    /// Working directory of every process this user can inspect (via libproc); nil when the list
+    /// of processes can't be read.
+    public static func all() -> [Int32: String]? {
         let n = proc_listallpids(nil, 0)
-        guard n > 0 else { return [:] }
+        guard n > 0 else { return nil }
         var pids = [Int32](repeating: 0, count: Int(n) + 128)
         let got = proc_listallpids(&pids, Int32(pids.count * MemoryLayout<Int32>.size))
+        guard got > 0 else { return nil }
         var out: [Int32: String] = [:]
         for pid in pids.prefix(Int(max(got, 0))) where pid > 0 {
             if let cwd = cwd(of: pid) { out[pid] = cwd }

@@ -725,7 +725,7 @@ private func exists(_ p: String) -> Bool { FileManager.default.fileExists(atPath
     _ = scanner.classify(entry, repo: box.repo, base: "origin/main", context: LiveContext(processes: [], cwds: [:], sessions: []), now: Date())
     let classifyTime = Date().timeIntervalSince(t0)
     let t1 = Date()
-    _ = LiveContext.capture()
+    _ = try LiveContext.capture()
     let captureTime = Date().timeIntervalSince(t1)
     print("ADV[toctou] classify=\(classifyTime)s capture=\(captureTime)s")
     let delay = captureTime + classifyTime * 0.6

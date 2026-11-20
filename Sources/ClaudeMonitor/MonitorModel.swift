@@ -184,9 +184,7 @@ final class MonitorModel: ObservableObject {
                 // any that become reclaimable again.
                 self.worktreeScan = self.worktreeScan?.removing(Set(items.map(\.path)))
                 var msg = removed.isEmpty ? "" : "Deleted \(removed.count) worktree(s), about \(Format.bytes(freed)) freed."
-                if let folder = savedMessages.first.map({ ($0 as NSString).deletingLastPathComponent }) {
-                    msg += " Saved \(savedMessages.count) unsent commit message(s) to \(Format.path(folder))."
-                }
+                if let note = WorktreeScanner.savedSummary(savedMessages) { msg += " " + note }
                 if !failures.isEmpty { msg += (msg.isEmpty ? "" : " ") + failures.joined(separator: "; ") }
                 self.worktreeMessage = msg
                 self.onUpdate?()

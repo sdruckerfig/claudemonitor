@@ -100,9 +100,10 @@ private func verdict(_ box: RBox, _ path: String) -> WorktreeVerdict? {
     let list = WorktreeScanner.git(["worktree", "list", "--porcelain", "-z"], in: box.repo)
     let wts = Worktrees.parsePorcelain(list.out)
     let real = WorktreeScanner.realPath(path)
-    guard let wt = wts.first(where: { $0.path == path || $0.path == real }) else { return nil }
+    guard let wt = wts.first(where: { $0.path == path || $0.path == real }),
+          let context = try? LiveContext.capture() else { return nil }
     return box.scanner().classify(wt, repo: WorktreeScanner.realPath(box.repo), base: "refs/remotes/origin/main",
-                                  context: LiveContext.capture(), allWorktreePaths: wts.map(\.path), now: Date()).0
+                                  context: context, allWorktreePaths: wts.map(\.path), now: Date()).0
 }
 
 private func offered(_ box: RBox, _ suffix: String) -> Bool {
@@ -384,7 +385,7 @@ private func offered(_ box: RBox, _ suffix: String) -> Bool {
     let wts = Worktrees.parsePorcelain(list.out)
     let w = try #require(wts.first { $0.path.hasSuffix("/wmp") })
     let v = box.scanner().classify(w, repo: WorktreeScanner.realPath(box.repo), base: "refs/remotes/origin/main",
-                                   context: LiveContext.capture(), allWorktreePaths: wts.map(\.path), now: Date()).0
+                                   context: try LiveContext.capture(), allWorktreePaths: wts.map(\.path), now: Date()).0
     print("R4[x] verdict=\(v.category): \(v.explanation)")
     #expect(v == .reclaimable)
 }
