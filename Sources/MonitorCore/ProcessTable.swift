@@ -15,8 +15,11 @@ public struct ProcessRow: Equatable, Sendable {
     /// Full command line from `ps -o args`.
     public let args: String
 
+    /// What the kernel adds to the `ps` row (owner, ports, folder…); filled by `ProcessInspector`.
+    public var details: ProcessDetails
+
     public init(pid: Int32, ppid: Int32, cpuPercent: Double, rssKB: Int64, elapsedSeconds: Int,
-                state: String, executablePath: String, args: String) {
+                state: String, executablePath: String, args: String, details: ProcessDetails = ProcessDetails()) {
         self.pid = pid
         self.ppid = ppid
         self.cpuPercent = cpuPercent
@@ -25,11 +28,48 @@ public struct ProcessRow: Equatable, Sendable {
         self.state = state
         self.executablePath = executablePath
         self.args = args
+        self.details = details
     }
 
     public var name: String { (executablePath as NSString).lastPathComponent }
     public var cores: Double { cpuPercent / 100 }
     public var rssBytes: Int64 { rssKB * 1024 }
+
+    /// When the process started, as of a snapshot taken at `takenAt` (to `ps`'s one-second resolution).
+    public func startTime(takenAt: Date) -> Date { takenAt.addingTimeInterval(-TimeInterval(elapsedSeconds)) }
+}
+
+/// What `ps` doesn't show, read from the kernel by `ProcessInspector`. Left empty (and
+/// `ownedByUser` false) for other users' processes, apps and system processes, and for a process
+/// that exited mid-sample, so anything that acts on processes fails closed.
+public struct ProcessDetails: Equatable, Sendable {
+    /// The process runs as the current user (only those can be stopped).
+    public var ownedByUser = false
+    /// The real executable (`proc_pidpath`). `ProcessRow.executablePath` comes from `ps -o comm`,
+    /// which can be just the name the process was started with.
+    public var imagePath: String?
+    /// Its current working folder.
+    public var cwd: String?
+    /// TCP ports it is listening on.
+    public var listeningPorts: [UInt16] = []
+    /// `CLAUDE_CODE_SESSION_ID` from its environment. Claude Code sets it for every command its
+    /// Bash tool runs, and everything those commands start inherits it.
+    public var claudeSessionId: String?
+    /// `CLAUDE_PID` from its environment: the claude process that started it.
+    public var claudePid: Int32?
+
+    public init(ownedByUser: Bool = false, imagePath: String? = nil, cwd: String? = nil,
+                listeningPorts: [UInt16] = [], claudeSessionId: String? = nil, claudePid: Int32? = nil) {
+        self.ownedByUser = ownedByUser
+        self.imagePath = imagePath
+        self.cwd = cwd
+        self.listeningPorts = listeningPorts
+        self.claudeSessionId = claudeSessionId
+        self.claudePid = claudePid
+    }
+
+    /// Its environment says a Claude session started it.
+    public var hasClaudeEnvironment: Bool { claudeSessionId != nil || claudePid != nil }
 }
 
 public enum ProcessTable {
@@ -69,7 +109,7 @@ public enum ProcessTable {
 
     /// Combines the two `ps` outputs. Processes that exited between the two calls are dropped.
     public static func merge(main: [Int32: ProcessRow], comm: [Int32: String]) -> [ProcessRow] {
-        main.values.compactMap { row in
+        main.values.map { row in
             let path = comm[row.pid] ?? firstToken(row.args)
             return ProcessRow(pid: row.pid, ppid: row.ppid, cpuPercent: row.cpuPercent, rssKB: row.rssKB,
                               elapsedSeconds: row.elapsedSeconds, state: row.state,

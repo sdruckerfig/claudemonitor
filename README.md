@@ -4,6 +4,7 @@ A macOS menu bar app that shows:
 
 - **Hardware health rollup** (green / yellow / red): is the machine overloaded?
 - **Every running Claude Code session**: status, the CPU and memory used by everything it started, and whether it needs attention.
+- **Leftover servers and build processes**: what closed sessions left running, every dev server listening on a port, and build daemons running on their own, each with a button to stop it.
 - **Reclaimable git worktrees**: worktrees that are safe to delete, how much disk they'd free, and a button to delete them.
 
 The menu bar shows a colored dot (the hardware rollup) and the number of Claude sessions. If any session is waiting on you, it also shows `· N⏳`. Click it for details.
@@ -11,7 +12,7 @@ The menu bar shows a colored dot (the hardware rollup) and the number of Claude 
 <p align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="docs/screenshot-dark.png">
-    <img src="docs/screenshot-light.png" width="480" alt="The Claude Monitor popover: a yellow hardware rollup because the CPU is oversubscribed, four Claude sessions (one waiting on you, one busy using two cores, two idle), three reclaimable worktrees totaling 2.2 GB with delete buttons, and the heaviest apps outside Claude.">
+    <img src="docs/screenshot-light.png" width="480" alt="The Claude Monitor popover: a yellow hardware rollup because the CPU is oversubscribed, four Claude sessions (one waiting on you, one busy using two cores, two idle), a Next.js dev server and a static file server left behind by closed sessions with stop buttons, three servers and build daemons (vite and postgres started by sessions, a Gradle daemon running on its own), three reclaimable worktrees totaling 2.2 GB with delete buttons, and the heaviest apps outside Claude.">
   </picture>
 </p>
 
@@ -83,7 +84,7 @@ All thresholds are in `Thresholds` (`Sources/MonitorCore/Health.swift`).
 
 ## Sessions
 
-Sessions are read from `~/.claude/sessions/<pid>.json`. This is an internal Claude Code format, so every field except `pid` is treated as optional. Each session is charged for its whole process tree. That includes background jobs it detached, which are found because their command lines contain the session ID (usually through its scratchpad path). Processes left behind by sessions that have exited are listed separately.
+Sessions are read from `~/.claude/sessions/<pid>.json`. This is an internal Claude Code format, so every field except `pid` is treated as optional. Each session is charged for its whole process tree. That includes background jobs it detached (`nohup`, build daemons), which are found because Claude Code puts `CLAUDE_CODE_SESSION_ID` and `CLAUDE_PID` in the environment of every command it runs, and everything those commands start inherits them, or because their command lines contain the session ID (usually through its scratchpad path). An app a session happened to launch, such as Docker Desktop, isn't charged to it. Processes left behind by sessions that have exited are listed separately (see below).
 
 | Session | When |
 |---|---|
@@ -91,7 +92,24 @@ Sessions are read from `~/.claude/sessions/<pid>.json`. This is an internal Clau
 | Yellow | ≥ 2 cores, ≥ 4 GB, or waiting on you for ≥ 10 min |
 | Stale (dimmed when otherwise green) | idle for ≥ 24 h |
 
-Right-click a session to reveal its folder, copy its PID, copy a `claude --resume` command, or end it (SIGTERM, with confirmation).
+Right-click a session to reveal its folder, copy its PID, copy a `claude --resume` command, or end it (SIGTERM, with confirmation). Click a session to list the processes it started, with any ports they listen on. Right-click one to stop it and everything under it (a runaway build or test run, say), or to force-stop it.
+
+## Leftover servers and build processes
+
+Two sections list processes you may want to stop:
+
+- **Left behind by closed sessions**: every process tree a Claude session started and left running after it closed, such as a dev server, a `tail -f`, or a build. A process counts when its environment names a session that is no longer running, or its command line contains a Claude shell snapshot or scratchpad path. It must also have nothing still running that started it: not an open app, and not a `claude` process without a session file (`claude -p`). **Stop All** stops every one.
+- **Servers & build daemons**: every other process listening on a TCP port, plus build daemons running on their own after their build exited (Gradle, Kotlin, MSBuild nodes, the C# compiler server, `esbuild`, `tsc --watch` and the like). Each row says who started it: a session, the app it runs under (Terminal, an editor), or "running on its own". These may still be in use, so they're stopped one at a time.
+
+Each row is a job: the process plus everything it started, named after what it runs (`vite`, `http.server`, `Gradle daemon`), with its ports, folder, age, CPU and memory. Identical jobs with no ports are listed once ("MSBuild node ×11"). A server's job starts at the topmost process that only started it, so stopping vite also stops the `npm run dev` above it, and a `node --watch` supervisor can't restart it. Right-click a row to open its port in a browser, reveal its folder, or copy its command.
+
+**Stop** asks for confirmation, then sends SIGTERM (**Force Stop** sends SIGKILL). First it reads the process table again, and it stops only the processes that are still the same ones, judged by start time, since pids are reused. It also stops anything those processes have started since. A suspended process is continued so it can act on SIGTERM. A few seconds later the app reports whatever is still running.
+
+These are never listed or stopped: other users' processes, macOS's own, installed apps and their helpers, `claude` itself, interactive shells, `tmux`, `screen`, `sshd`, `login`, `sudo`, and jobs launchd manages (Homebrew services, login agents). A job never reaches past one of them, so stopping a server in a tmux pane leaves tmux and the pane's shell running. Servers under a launchd job are left out, since launchd may restart them. If `launchctl list` can't be read, nothing outside Claude counts as running on its own.
+
+To find these, the app reads each of your processes' working folder, listening sockets and executable path through libproc. It also reads their environment, but only to look for `CLAUDE_CODE_SESSION_ID` and `CLAUDE_PID`. Everything else in the environment, which can hold tokens and keys, is skipped without being copied, and the buffer is zeroed afterwards. Nothing is stored or sent anywhere. For apps and macOS's own processes it reads only the owner and executable path, which is how it tells them apart.
+
+The rules are in `Sources/MonitorCore/Jobs.swift`, `ProcessKind.swift` and `ProcessStopper.swift`.
 
 ## Reclaimable worktrees
 
@@ -123,7 +141,7 @@ The rule settings are in `WorktreePolicy` (`Sources/MonitorCore/Worktrees.swift`
 ## Layout
 
 ```
-Sources/MonitorCore/     testable logic: ps parsing, attribution, health rules, worktree rules
+Sources/MonitorCore/     testable logic: ps parsing, process details (libproc), attribution, leftover and server rules, stopping, health rules, worktree rules
 Sources/ClaudeMonitor/   AppKit status item + SwiftUI popover
 Tests/MonitorCoreTests/  swift test (includes end-to-end worktree tests on throwaway repos)
 scripts/                 build-app.sh, make-pkg.sh (+ pkg/postinstall), test.sh, screenshot.sh

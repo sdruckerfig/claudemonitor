@@ -87,6 +87,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if let s = snapshot {
             tip = "Hardware: \(TextReport.word(s.rollup))\n\(s.sessions.count) Claude sessions"
             for r in s.reasons { tip += "\n• \(r)" }
+            if !s.leftovers.isEmpty {
+                let mem = s.leftovers.reduce(Int64(0)) { $0 + $1.totalRSSBytes }
+                tip += "\n\(s.leftovers.count) left behind by closed sessions (\(Format.bytes(mem)))"
+            }
         }
         if let w = model.worktreeScan, !w.reclaimable.isEmpty {
             tip += "\n\(w.reclaimable.count) worktrees can be deleted (about \(Format.bytes(w.totalBytes)))"

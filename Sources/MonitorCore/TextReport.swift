@@ -24,15 +24,23 @@ public enum TextReport {
             for why in r.reasons { lines.append("      ! \(why)") }
             for p in u.descendants.prefix(3) where p.cpuPercent >= 5 {
                 let det = u.detachedPids.contains(p.pid) ? " (detached)" : ""
-                lines.append("      \(p.name): \(Format.cores(p.cores)), \(Format.bytes(p.rssBytes))\(det)")
+                lines.append("      \(ProcessKind.label(p)): \(Format.cores(p.cores)), \(Format.bytes(p.rssBytes))\(det)")
             }
         }
 
-        if !s.orphans.isEmpty {
-            let cores = s.orphans.reduce(0) { $0 + $1.cores }
-            let mem = s.orphans.reduce(Int64(0)) { $0 + $1.rssBytes }
+        if !s.leftovers.isEmpty {
+            let cores = s.leftovers.reduce(0) { $0 + $1.totalCores }
+            let mem = s.leftovers.reduce(Int64(0)) { $0 + $1.totalRSSBytes }
+            let count = s.leftovers.reduce(0) { $0 + $1.members.count }
             lines.append("")
-            lines.append("Left behind by closed sessions: \(s.orphans.count) processes, \(Format.cores(cores)), \(Format.bytes(mem))")
+            lines.append("Left behind by closed sessions: \(count) processes, \(Format.cores(cores)), \(Format.bytes(mem))")
+            for j in s.leftovers { lines.append(job(j)) }
+        }
+
+        if !s.services.isEmpty {
+            lines.append("")
+            lines.append("Servers & build daemons: \(s.services.count)")
+            for j in s.services { lines.append(job(j)) }
         }
 
         if !s.otherGroups.isEmpty {
@@ -56,6 +64,13 @@ public enum TextReport {
             lines.append("  \(size.padding(toLength: 8, withPad: " ", startingAt: 0)) \(Format.path(w.path))  [\(w.branch ?? "detached")\(age)]")
         }
         return lines.joined(separator: "\n")
+    }
+
+    static func job(_ j: ProcessJob) -> String {
+        var line = "  \(j.title)  \(Format.cores(j.totalCores)), \(Format.bytes(j.totalRSSBytes)), "
+        line += "\(Format.duration(TimeInterval(j.elapsedSeconds))), pid \(j.root.pid), \(j.ownerText)"
+        if let cwd = j.cwd { line += "  \(Format.path(cwd))" }
+        return line
     }
 
     public static func word(_ l: Level) -> String {

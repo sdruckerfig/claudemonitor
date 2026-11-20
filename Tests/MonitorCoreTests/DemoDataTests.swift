@@ -11,7 +11,10 @@ import Testing
     #expect(s.sessions.map(\.usage.record.name) == ["Fix flaky login test", "Checkout redesign", "API rate limiting", "Docs cleanup"])
     #expect(s.sessions.map(\.level) == [.yellow, .yellow, .green, .green])
     #expect(s.sessions.last?.isStale == true)
-    #expect(s.orphans.count == 2)
+    #expect(s.leftovers.map(\.name) == ["next :3000", "http.server :8000"])
+    #expect(s.leftovers.map(\.members.count) == [2, 1])
+    #expect(s.services.map(\.name) == ["vite :5173", "postgres :5432", "Gradle daemon"])
+    #expect(s.services.map(\.ownerText) == ["session “Checkout redesign”", "session “API rate limiting”", "running on its own"])
     #expect(s.otherGroups.map(\.name) == ["Safari", "Docker", "Simulators", "Mail"])
 
     let scan = DemoData.worktreeScan(now: now, home: "/Users/demo")

@@ -20,9 +20,13 @@ final class MonitorModel: ObservableObject {
     @Published private(set) var deletingWorktrees: Set<String> = []
     @Published private(set) var worktreeMessage: String?
 
+    /// Root pids of jobs being stopped.
+    @Published private(set) var stoppingJobs: Set<Int32> = []
+
     // View state lives here: SwiftUI's @State is a macro that Command Line Tools cannot expand.
     @Published var expandedSessions: Set<Int32> = []
-    @Published var showOrphans = false
+    @Published var showLeftovers = true
+    @Published var showServices = false
     @Published var showWorktrees = true
 
     var onUpdate: (() -> Void)?
@@ -106,6 +110,7 @@ final class MonitorModel: ObservableObject {
     func showDemo(now: Date) {
         snapshot = DemoData.snapshot(now: now)
         worktreeScan = DemoData.worktreeScan(now: now)
+        showServices = true
         launchAtLogin = true
         errorText = nil
         notice = nil
@@ -246,6 +251,138 @@ final class MonitorModel: ObservableObject {
             notice = nil
         }
         refresh()
+    }
+
+    // MARK: Stopping processes
+
+    /// Asks for confirmation, then stops each job: SIGTERM (or SIGKILL when `force`) to every
+    /// process in it that is still the same process, and to anything it started since.
+    /// `takenAt` dates the jobs' rows: the snapshot they were shown from, which may be older
+    /// than `snapshot` by now.
+    func confirmStop(_ jobs: [ProcessJob], takenAt: Date, force: Bool = false) {
+        guard !jobs.isEmpty else { return }
+        let count = jobs.reduce(0) { $0 + $1.members.count }
+        let signalName = force ? "SIGKILL" : "SIGTERM"
+        let alert = NSAlert()
+        let verb = force ? "Force stop" : "Stop"
+        if jobs.count == 1 {
+            alert.messageText = "\(verb) \(jobs[0].name)?"
+        } else {
+            alert.messageText = "\(verb) \(jobs.count) process groups?"
+        }
+        var info = "Sends \(signalName) to \(count == 1 ? "1 process" : "\(count) processes")"
+        if jobs.count == 1 {
+            let j = jobs[0]
+            switch j.owner {
+            case .session(_, let name): info += " started by session “\(name)”, which may still be using it"
+            case .closedSession: info += " left behind by a closed Claude session"
+            case .detached: info += " running on \(count == 1 ? "its" : "their") own (whatever started \(count == 1 ? "it" : "them") has exited)"
+            case .launcher(let name): info += " started from \(name)"
+            }
+            info += ":\n\n" + j.members.prefix(8).map { "• \($0.pid)  \(Self.shorten($0.args))" }.joined(separator: "\n")
+            if j.members.count > 8 { info += "\n…and \(j.members.count - 8) more" }
+            if let cwd = j.cwd { info += "\n\nFolder: \(Format.path(cwd))" }
+        } else {
+            let lines = jobs.prefix(12).map { (j: ProcessJob) -> String in
+                let folder: String = j.cwd.map { "  " + Format.path($0) } ?? ""
+                return "• \(j.title), pid \(j.root.pid)\(folder)"
+            }
+            info += ":\n\n" + lines.joined(separator: "\n")
+            if jobs.count > 12 { info += "\n…and \(jobs.count - 12) more" }
+        }
+        info += force
+            ? "\n\nSIGKILL can't be caught: they get no chance to clean up (temporary files, locks, child processes)."
+            : "\n\nEach process is checked again just before the signal is sent."
+        alert.informativeText = info
+        alert.alertStyle = .warning
+        alert.addButton(withTitle: force ? "Force Stop" : (jobs.count == 1 ? "Stop" : "Stop \(jobs.count)"))
+        alert.addButton(withTitle: "Cancel")
+        NSApp.activate(ignoringOtherApps: true)
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        stop(jobs, takenAt: takenAt, signal: force ? SIGKILL : SIGTERM)
+    }
+
+    /// A process in a session's tree, with everything under it, as a job to stop; nil if it
+    /// can't be stopped (claude itself, an interactive shell, an app, someone else's process).
+    func job(for process: ProcessRow, in u: SessionUsage) -> ProcessJob? {
+        guard Jobs.isStoppable(process) else { return nil }
+        var members = [process]
+        var queue = [process.pid]
+        while !queue.isEmpty {
+            let pid = queue.removeFirst()
+            for c in u.descendants where c.ppid == pid && !members.contains(where: { $0.pid == c.pid }) && Jobs.isStoppable(c) {
+                members.append(c)
+                queue.append(c.pid)
+            }
+        }
+        return ProcessJob(roots: [process], members: members, owner: .session(pid: u.process.pid, name: u.record.name),
+                          label: ProcessKind.label(process),
+                          ports: Set(members.flatMap(\.details.listeningPorts)).sorted(), cwd: process.details.cwd)
+    }
+
+    private func stop(_ jobs: [ProcessJob], takenAt: Date, signal: Int32) {
+        let roots = Set(jobs.map(\.id))
+        stoppingJobs.formUnion(roots)
+        let monitor = monitor
+        let queue = queue
+        let what = jobs.count == 1 ? jobs[0].title : "\(jobs.count) process groups"
+        let members = jobs.flatMap(\.members)
+        // The sampler's queue: `Monitor` is used from that one queue. The user is waiting, so
+        // don't run throttled (.enforceQoS: otherwise the queue's utility QoS wins).
+        queue.async(qos: .userInitiated, flags: .enforceQoS) {
+            let freshAt = Date()
+            let outcome: ProcessStopper.Outcome
+            do {
+                let fresh = try monitor.processTable(takenAt: freshAt)
+                let plan = ProcessStopper.plan(members: members, takenAt: takenAt, fresh: fresh, freshTakenAt: freshAt)
+                outcome = ProcessStopper.send(signal, to: plan, takenAt: freshAt)
+            } catch {
+                DispatchQueue.main.async { self.finishStop(roots, notice: "Could not stop \(what): \(error)") }
+                return
+            }
+            // Give them a moment to exit, then see what's left.
+            queue.asyncAfter(deadline: .now() + (outcome.signalled.isEmpty ? 0 : 2)) {
+                let left = ProcessStopper.stillRunning(outcome.signalled, takenAt: freshAt)
+                let notice = Self.stopNotice(what: what, signal: signal, outcome: outcome, stillRunning: left)
+                DispatchQueue.main.async { self.finishStop(roots, notice: notice) }
+            }
+        }
+    }
+
+    private func finishStop(_ roots: Set<Int32>, notice: String?) {
+        stoppingJobs.subtract(roots)
+        self.notice = notice
+        refresh()
+    }
+
+    nonisolated static func stopNotice(what: String, signal: Int32, outcome: ProcessStopper.Outcome,
+                                       stillRunning left: [ProcessRow]) -> String? {
+        func count(_ n: Int) -> String { n == 1 ? "1 process" : "\(n) processes" }
+        let sent = outcome.signalled.count
+        var parts: [String] = []
+        if sent == 0 && outcome.failed.isEmpty {
+            parts.append("Nothing to stop: \(what) had already exited.")
+        } else if sent > 0 && left.isEmpty {
+            parts.append("\(signal == SIGKILL ? "Force-stopped" : "Stopped") \(what).")
+        } else if sent > 0 {
+            let names = left.prefix(3).map { "\($0.name) \($0.pid)" }.joined(separator: ", ")
+            parts.append("Sent \(signal == SIGKILL ? "SIGKILL" : "SIGTERM") to \(count(sent)); \(left.count) still running (\(names)).")
+            if signal != SIGKILL { parts.append("Right-click to Force Stop.") }
+        }
+        if let (row, why) = outcome.failed.first {
+            parts.append("Could not signal \(row.name) \(row.pid): \(why)" + (outcome.failed.count > 1 ? " (and \(outcome.failed.count - 1) more)." : "."))
+        }
+        return parts.joined(separator: " ")
+    }
+
+    func open(port: UInt16) {
+        if let url = URL(string: "http://localhost:\(port)") { NSWorkspace.shared.open(url) }
+    }
+
+    nonisolated static func shorten(_ s: String, max: Int = 90) -> String {
+        guard s.count > max else { return s }
+        let half = (max - 1) / 2
+        return String(s.prefix(half)) + "…" + String(s.suffix(half))
     }
 
     private func shellQuote(_ s: String) -> String {

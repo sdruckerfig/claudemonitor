@@ -8,24 +8,33 @@ public struct Snapshot: Sendable {
     public let rollup: Level
     /// Sessions, most urgent first.
     public let sessions: [SessionReport]
-    public let orphans: [ProcessRow]
+    /// Process trees left behind by closed sessions; servers first.
+    public let leftovers: [ProcessJob]
+    /// Everything else listening on a TCP port, and detached build daemons, whoever started them.
+    public let services: [ProcessJob]
     /// Heaviest non-Claude process groups.
     public let otherGroups: [ProcessGroup]
 
     public var reasons: [String] { hardware.compactMap(\.reason) }
 
+    /// - Parameter launchdJobs: pids launchd manages (`LaunchdJobs.pids()`); nil if unknown.
     public static func assemble(system: SystemMetrics, processes: [ProcessRow], records: [SessionRecord],
-                                now: Date, thresholds: Thresholds = Thresholds()) -> Snapshot {
+                                launchdJobs: Set<Int32>? = nil, now: Date,
+                                thresholds: Thresholds = Thresholds()) -> Snapshot {
         let hardware = Health.hardware(system, thresholds)
         let attribution = Attribution.build(processes: processes, records: records)
         let reports = attribution.sessions
             .map { Health.session($0, now: now, thresholds) }
             .sorted(by: moreUrgent)
-        let groups = Attribution.groups(attribution.other)
+        let jobs = Jobs.build(attribution, processes: processes, launchdJobs: launchdJobs)
+        // Jobs listed as services aren't counted again in the app groups.
+        let listed = Set(jobs.services.flatMap { $0.members.map(\.pid) })
+        let groups = Attribution.groups(attribution.other.filter { !listed.contains($0.pid) })
             .filter { $0.cores >= 0.1 || $0.rssBytes >= 500 * 1_048_576 }
             .sorted { ($0.cores, $0.rssBytes) > ($1.cores, $1.rssBytes) }
         return Snapshot(takenAt: now, system: system, hardware: hardware, rollup: Health.rollup(hardware),
-                        sessions: reports, orphans: attribution.orphans, otherGroups: Array(groups.prefix(6)))
+                        sessions: reports, leftovers: jobs.leftovers, services: jobs.services,
+                        otherGroups: Array(groups.prefix(6)))
     }
 
     static func moreUrgent(_ a: SessionReport, _ b: SessionReport) -> Bool {
@@ -59,6 +68,7 @@ public enum MonitorError: Error, CustomStringConvertible {
 public final class Monitor: @unchecked Sendable {
     public var thresholds: Thresholds
     private let sampler = SystemSampler()
+    private let inspector = ProcessInspector()
     private let sessionsDirectory: URL
 
     public init(sessionsDirectory: URL = SessionFiles.defaultDirectory, thresholds: Thresholds = Thresholds()) {
@@ -69,11 +79,18 @@ public final class Monitor: @unchecked Sendable {
     public func snapshot() throws -> Snapshot {
         let now = Date()
         let system = sampler.sample(now: now)
+        let processes = try processTable(takenAt: now)
+        let records = SessionFiles.load(from: sessionsDirectory)
+        return Snapshot.assemble(system: system, processes: processes, records: records,
+                                 launchdJobs: LaunchdJobs.pids(), now: now, thresholds: thresholds)
+    }
+
+    /// Every process, with the details `ProcessInspector` adds. `takenAt` should be read just
+    /// before calling: it dates the rows' elapsed times.
+    public func processTable(takenAt: Date) throws -> [ProcessRow] {
         let main = ProcessTable.parseMain(try Self.ps(ProcessTable.mainArguments))
         let comm = ProcessTable.parseComm(try Self.ps(ProcessTable.commArguments))
-        let processes = ProcessTable.merge(main: main, comm: comm)
-        let records = SessionFiles.load(from: sessionsDirectory)
-        return Snapshot.assemble(system: system, processes: processes, records: records, now: now, thresholds: thresholds)
+        return inspector.enrich(ProcessTable.merge(main: main, comm: comm))
     }
 
     static func ps(_ args: [String]) throws -> String {

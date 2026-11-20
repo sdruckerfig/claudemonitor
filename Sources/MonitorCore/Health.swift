@@ -160,9 +160,9 @@ public enum Health {
 
         let cores = u.totalCores
         if cores >= t.sessionCoresRed {
-            flag(.red, "Using \(Format.cores(cores))" + (u.topChild.map { ", mostly \($0.name)" } ?? ""))
+            flag(.red, "Using \(Format.cores(cores))" + (u.topChild.map { ", mostly \(ProcessKind.label($0))" } ?? ""))
         } else if cores >= t.sessionCoresYellow {
-            flag(.yellow, "Using \(Format.cores(cores))" + (u.topChild.map { ", mostly \($0.name)" } ?? ""))
+            flag(.yellow, "Using \(Format.cores(cores))" + (u.topChild.map { ", mostly \(ProcessKind.label($0))" } ?? ""))
         }
 
         let gb = Double(u.totalRSSBytes) / 1_073_741_824

@@ -29,6 +29,9 @@ public struct Attribution: Sendable {
     public let sessions: [SessionUsage]
     /// Processes launched by Claude sessions that have since exited.
     public let orphans: [ProcessRow]
+    /// `orphans` as trees: each root (the topmost process with evidence of a closed session) and
+    /// every pid in its tree, root first.
+    public let orphanTrees: [(root: Int32, pids: [Int32])]
     /// Everything not attributable to Claude.
     public let other: [ProcessRow]
 
@@ -60,17 +63,42 @@ public struct Attribution: Sendable {
         var treePids: [Int32: [Int32]] = [:]
         for r in live { treePids[r.pid] = collect(from: children[r.pid] ?? []) }
 
-        // Background jobs a session detached (nohup / reparented to launchd) still carry the
-        // session id in their command line, usually via the session's scratchpad path.
+        // Background jobs a session detached (nohup / reparented to launchd) still name the
+        // session: in their environment, or in their command line via the scratchpad path.
         var detached: [Int32: [Int32]] = [:]
         for r in live {
-            guard let id = r.sessionId, !id.isEmpty else { continue }
-            let roots = processes.filter { !claimed.contains($0.pid) && $0.args.contains(id) }.map(\.pid)
+            guard let session = byPid[r.pid] else { continue }
+            let roots = processes.filter { !claimed.contains($0.pid) && started($0, by: r, process: session) }.map(\.pid)
             detached[r.pid] = collect(from: roots)
         }
 
-        let orphanRoots = processes.filter { !claimed.contains($0.pid) && looksClaudeLaunched($0) }.map(\.pid)
-        let orphans = collect(from: orphanRoots).compactMap { byPid[$0] }
+        // What closed sessions left behind. A root is the topmost process with that evidence:
+        // its parent has none (usually it's launchd, after the session's shell exited).
+        // Claude processes, interactive shells and tmux and the like are never part of a leftover.
+        /// Something that started `p` is still running: a claude process without a session file
+        /// (`claude -p`), named by CLAUDE_PID or above it in the tree, or an app it runs inside.
+        func hasLiveOwner(_ p: ProcessRow) -> Bool {
+            if let cp = p.details.claudePid, let owner = byPid[cp], isClaude(owner),
+               owner.elapsedSeconds >= p.elapsedSeconds { return true }
+            var cur = p
+            var hops = 0
+            while let parent = byPid[cur.ppid], parent.pid > 1, hops < 64 {
+                if isClaude(parent) || ProcessKind.isAppOrSystem(parent) { return true }
+                cur = parent
+                hops += 1
+            }
+            return false
+        }
+        let candidates = Set(processes.filter { p in
+            !claimed.contains(p.pid) && looksClaudeLaunched(p) && !isClaude(p) && !ProcessKind.isBoundary(p) && !hasLiveOwner(p)
+        }.map(\.pid))
+        let orphanRoots = candidates.filter { pid in byPid[pid].map { !candidates.contains($0.ppid) } ?? false }.sorted()
+        var orphanTrees: [(root: Int32, pids: [Int32])] = []
+        for root in orphanRoots {
+            let pids = collect(from: [root])
+            if !pids.isEmpty { orphanTrees.append((root, pids)) }
+        }
+        let orphans = orphanTrees.flatMap(\.pids).compactMap { byPid[$0] }
 
         let sessions = live.compactMap { r -> SessionUsage? in
             guard let proc = byPid[r.pid] else { return nil }
@@ -81,7 +109,19 @@ public struct Attribution: Sendable {
                                 detachedPids: Set(det))
         }
         let other = processes.filter { !claimed.contains($0.pid) }
-        return Attribution(sessions: sessions, orphans: orphans.sorted(by: heavierFirst), other: other)
+        return Attribution(sessions: sessions, orphans: orphans.sorted(by: heavierFirst), orphanTrees: orphanTrees, other: other)
+    }
+
+    /// True when `p` (not in the session's process tree) was started by the live session `r`,
+    /// whose claude process is `s`: its command line names the session, or its environment does.
+    /// Apps are only matched by command line: one a session happened to launch is the user's.
+    static func started(_ p: ProcessRow, by r: SessionRecord, process s: ProcessRow) -> Bool {
+        if let id = r.sessionId, !id.isEmpty, p.args.contains(id) { return true }
+        guard p.details.hasClaudeEnvironment, !ProcessKind.isAppOrSystem(p) else { return false }
+        if let id = r.sessionId, !id.isEmpty, p.details.claudeSessionId == id { return true }
+        // /clear gives the session a new id, but CLAUDE_PID still names its claude process. A
+        // reused pid would belong to a claude that started after `p` did.
+        return p.details.claudePid == s.pid && s.elapsedSeconds >= p.elapsedSeconds
     }
 
     public static func isClaude(_ p: ProcessRow) -> Bool {
@@ -91,9 +131,11 @@ public struct Attribution: Sendable {
         return (first as NSString).lastPathComponent == "node" && p.args.contains("/claude")
     }
 
-    /// Command lines Claude Code's Bash tool produces: shell snapshots or per-session temp dirs.
+    /// Started by Claude Code's Bash tool: its environment says so (apps excepted, as above), or
+    /// its command line has a shell snapshot or a per-session temp folder in it.
     static func looksClaudeLaunched(_ p: ProcessRow) -> Bool {
-        p.args.contains("/.claude/shell-snapshots/") ||
+        if p.details.hasClaudeEnvironment && !ProcessKind.isAppOrSystem(p) { return true }
+        return p.args.contains("/.claude/shell-snapshots/") ||
             p.args.range(of: #"/claude-\d+/"#, options: .regularExpression) != nil
     }
 

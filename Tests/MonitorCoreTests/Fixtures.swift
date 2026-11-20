@@ -1,10 +1,14 @@
 import Foundation
 @testable import MonitorCore
 
+/// A process row. Unless `mine` is false it belongs to the current user, as the inspector would report.
 func row(_ pid: Int32, parent: Int32, cpu: Double = 0, rssMB: Int64 = 10, path: String, args: String? = nil,
-         state: String = "S", elapsed: Int = 60) -> ProcessRow {
+         state: String = "S", elapsed: Int = 60, ports: [UInt16] = [], cwd: String? = nil,
+         session: String? = nil, claudePid: Int32? = nil, mine: Bool = true) -> ProcessRow {
     ProcessRow(pid: pid, ppid: parent, cpuPercent: cpu, rssKB: rssMB * 1024, elapsedSeconds: elapsed,
-               state: state, executablePath: path, args: args ?? path)
+               state: state, executablePath: path, args: args ?? path,
+               details: ProcessDetails(ownedByUser: mine, cwd: cwd, listeningPorts: ports,
+                                       claudeSessionId: session, claudePid: claudePid))
 }
 
 func record(_ pid: Int32, id: String? = nil, name: String = "s", status: SessionStatus = .idle,

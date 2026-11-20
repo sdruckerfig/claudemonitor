@@ -15,8 +15,9 @@ struct StatusView: View {
                     if let s = model.snapshot {
                         hardware(s)
                         sessions(s)
+                        if !s.leftovers.isEmpty { leftovers(s) }
+                        if !s.services.isEmpty { services(s) }
                         worktrees
-                        if !s.orphans.isEmpty { orphans(s) }
                         if !s.otherGroups.isEmpty { outside(s) }
                     } else {
                         ProgressView("Sampling…").frame(maxWidth: .infinity).padding(.top, 40)
@@ -171,28 +172,65 @@ struct StatusView: View {
         return kept.isEmpty ? s + "." : s + ". Kept: \(kept)."
     }
 
-    // MARK: Orphans / outside
+    // MARK: Leftovers and services
 
-    private func orphans(_ s: Snapshot) -> some View {
-        let cores = s.orphans.reduce(0) { $0 + $1.cores }
-        let mem = s.orphans.reduce(Int64(0)) { $0 + $1.rssBytes }
+    private func leftovers(_ s: Snapshot) -> some View {
+        let jobs = s.leftovers
+        let cores = jobs.reduce(0) { $0 + $1.totalCores }
+        let mem = jobs.reduce(Int64(0)) { $0 + $1.totalRSSBytes }
         return VStack(alignment: .leading, spacing: 6) {
-            Button { model.showOrphans.toggle() } label: {
-                HStack {
-                    Image(systemName: model.showOrphans ? "chevron.down" : "chevron.right").font(.caption2)
-                    sectionTitle("Left behind by closed sessions")
-                    Spacer()
-                    Text("\(s.orphans.count) · \(Format.cores(cores)) · \(Format.bytes(mem))")
-                        .font(.caption).foregroundStyle(.secondary).monospacedDigit()
-                }
-                .contentShape(Rectangle())
+            collapsibleTitle("Left behind by closed sessions", isOpen: model.showLeftovers,
+                             summary: "\(jobs.count) · \(Format.cores(cores)) · \(Format.bytes(mem))") {
+                model.showLeftovers.toggle()
             }
-            .buttonStyle(.plain)
-            if model.showOrphans {
-                ForEach(s.orphans.prefix(12), id: \.pid) { p in ProcessLine(process: p, detached: false) }
+            if model.showLeftovers {
+                ForEach(jobs.prefix(Self.jobLimit)) { j in JobRow(job: j, takenAt: s.takenAt, model: model) }
+                if jobs.count > Self.jobLimit {
+                    Text("+ \(jobs.count - Self.jobLimit) more").font(.caption).foregroundStyle(.secondary)
+                }
+                if jobs.count > 1 {
+                    HStack {
+                        Spacer()
+                        Button("Stop All \(jobs.count)…") { model.confirmStop(jobs, takenAt: s.takenAt) }
+                            .disabled(!model.stoppingJobs.isDisjoint(with: jobs.map(\.id)))
+                    }
+                    .controlSize(.small)
+                }
             }
         }
     }
+
+    private func services(_ s: Snapshot) -> some View {
+        let jobs = s.services
+        let mem = jobs.reduce(Int64(0)) { $0 + $1.totalRSSBytes }
+        return VStack(alignment: .leading, spacing: 6) {
+            collapsibleTitle("Servers & build daemons", isOpen: model.showServices,
+                             summary: "\(jobs.count) · \(Format.bytes(mem))") {
+                model.showServices.toggle()
+            }
+            if model.showServices {
+                ForEach(jobs) { j in JobRow(job: j, takenAt: s.takenAt, model: model) }
+            }
+        }
+    }
+
+    private static let jobLimit = 10
+
+    private func collapsibleTitle(_ title: String, isOpen: Bool, summary: String,
+                                  toggle: @escaping () -> Void) -> some View {
+        Button(action: toggle) {
+            HStack(spacing: 6) {
+                Image(systemName: isOpen ? "chevron.down" : "chevron.right").font(.caption2)
+                sectionTitle(title)
+                Spacer()
+                Text(summary).font(.caption).foregroundStyle(.secondary).monospacedDigit()
+            }
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+    }
+
+    // MARK: Outside
 
     private func outside(_ s: Snapshot) -> some View {
         VStack(alignment: .leading, spacing: 6) {
@@ -284,7 +322,8 @@ struct SessionRow: View {
                         Text("No child processes").font(.caption).foregroundStyle(.secondary)
                     }
                     ForEach(u.descendants.prefix(10), id: \.pid) { p in
-                        ProcessLine(process: p, detached: u.detachedPids.contains(p.pid))
+                        ProcessLine(process: p, detached: u.detachedPids.contains(p.pid),
+                                    job: model.job(for: p, in: u), takenAt: now, model: model)
                     }
                     if u.descendants.count > 10 {
                         Text("+ \(u.descendants.count - 10) more").font(.caption).foregroundStyle(.secondary)
@@ -310,7 +349,7 @@ struct SessionRow: View {
         if let cwd = u.record.cwd { parts.append(Format.path(cwd)) }
         if let age = report.statusAge { parts.append("\(u.record.status.label) \(Format.duration(age))") }
         if report.isStale { parts.append("stale") }
-        if let top = u.topChild, top.cpuPercent >= 10 { parts.append("\(top.name) \(Format.cores(top.cores))") }
+        if let top = u.topChild, top.cpuPercent >= 10 { parts.append("\(ProcessKind.label(top)) \(Format.cores(top.cores))") }
         return parts.joined(separator: " · ")
     }
 }
@@ -378,10 +417,19 @@ struct StatusChip: View {
 struct ProcessLine: View {
     let process: ProcessRow
     let detached: Bool
+    /// The process and what it started, if it can be stopped.
+    let job: ProcessJob?
+    /// When the snapshot these rows come from was taken.
+    let takenAt: Date
+    let model: MonitorModel
 
     var body: some View {
         HStack(spacing: 6) {
-            Text(process.name).font(.caption.weight(.medium)).lineLimit(1)
+            Text(ProcessKind.label(process)).font(.caption.weight(.medium)).lineLimit(1)
+            if !process.details.listeningPorts.isEmpty {
+                Text(process.details.listeningPorts.map { ":\($0)" }.joined(separator: " "))
+                    .font(.caption2).monospacedDigit().foregroundStyle(.secondary)
+            }
             if detached {
                 Text("detached").font(.caption2).foregroundStyle(.secondary)
             }
@@ -391,5 +439,98 @@ struct ProcessLine: View {
                 .font(.caption).monospacedDigit().foregroundStyle(.secondary)
         }
         .help(process.args)
+        .contextMenu {
+            if let job {
+                Button(job.members.count > 1 ? "Stop \(job.label) and \(job.members.count - 1) More…" : "Stop \(job.label)…") {
+                    model.confirmStop([job], takenAt: takenAt)
+                }
+                Button("Force Stop…") { model.confirmStop([job], takenAt: takenAt, force: true) }
+                Divider()
+            }
+            Button("Copy PID (\(process.pid))") { model.copy("\(process.pid)") }
+            Button("Copy Command") { model.copy(process.args) }
+        }
+    }
+}
+
+struct JobRow: View {
+    let job: ProcessJob
+    /// When the snapshot `job` comes from was taken.
+    let takenAt: Date
+    @ObservedObject var model: MonitorModel
+
+    var body: some View {
+        let stopping = model.stoppingJobs.contains(job.id)
+        HStack(alignment: .top, spacing: 8) {
+            Image(systemName: icon).foregroundStyle(.secondary).frame(width: 14).padding(.top, 2)
+            VStack(alignment: .leading, spacing: 1) {
+                HStack(spacing: 6) {
+                    Text(job.roots.count > 1 ? "\(job.label) ×\(job.roots.count)" : job.label)
+                        .fontWeight(.medium).lineLimit(1)
+                    if !job.ports.isEmpty {
+                        Text(job.portList(max: 3)).font(.callout).monospacedDigit().foregroundStyle(.secondary)
+                            .fixedSize()
+                    }
+                }
+                // The folder gives way first, so who started it and how long ago stay readable.
+                HStack(spacing: 0) {
+                    if let cwd = job.cwd {
+                        Text(Format.path(cwd)).lineLimit(1).truncationMode(.middle)
+                        Text(" · ")
+                    }
+                    Text(facts).lineLimit(1).layoutPriority(1)
+                }
+                .font(.caption).foregroundStyle(.secondary)
+            }
+            Spacer(minLength: 4)
+            Text("\(Format.cores(job.totalCores)) · \(Format.bytes(job.totalRSSBytes))")
+                .font(.callout).monospacedDigit()
+                .foregroundStyle(job.totalCores >= 1 ? .primary : .secondary)
+                .fixedSize()
+            if stopping {
+                ProgressView().controlSize(.mini)
+            } else {
+                Button { model.confirmStop([job], takenAt: takenAt) } label: { Image(systemName: "stop.circle") }
+                    .buttonStyle(.borderless)
+                    .help(job.members.count > 1 ? "Stop these \(job.members.count) processes" : "Stop this process")
+            }
+        }
+        .opacity(stopping ? 0.5 : 1)
+        .help(tooltip)
+        .contextMenu {
+            Button("Stop…") { model.confirmStop([job], takenAt: takenAt) }
+            Button("Force Stop…") { model.confirmStop([job], takenAt: takenAt, force: true) }
+            Divider()
+            ForEach(job.ports.prefix(3), id: \.self) { port in
+                Button("Open localhost:\(String(port)) in Browser") { model.open(port: port) }
+            }
+            Button("Reveal Folder in Finder") { model.revealFolder(job.cwd) }.disabled(job.cwd == nil)
+            if job.roots.count == 1 {
+                Button("Copy PID (\(job.root.pid))") { model.copy("\(job.root.pid)") }
+            } else {
+                Button("Copy PIDs") { model.copy(job.roots.map { "\($0.pid)" }.joined(separator: " ")) }
+            }
+            Button("Copy Command") { model.copy(job.root.args) }
+        }
+    }
+
+    private var icon: String {
+        if !job.ports.isEmpty { return "network" }
+        return job.members.contains(where: ProcessKind.isBuildTool) ? "hammer" : "terminal"
+    }
+
+    /// Everything on the second line after the folder.
+    private var facts: String {
+        var parts: [String] = []
+        if !job.isLeftover { parts.append(job.ownerText) }   // the section title already says it
+        parts.append(Format.duration(TimeInterval(job.elapsedSeconds)))
+        if job.members.count > job.roots.count { parts.append("\(job.members.count) processes") }
+        return parts.joined(separator: " · ")
+    }
+
+    private var tooltip: String {
+        var lines = job.members.prefix(6).map { "\($0.pid)  \(MonitorModel.shorten($0.args, max: 160))" }
+        if job.members.count > 6 { lines.append("…and \(job.members.count - 6) more") }
+        return lines.joined(separator: "\n")
     }
 }

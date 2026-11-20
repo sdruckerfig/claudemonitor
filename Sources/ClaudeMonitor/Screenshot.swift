@@ -6,7 +6,7 @@ import SwiftUI
 /// (debug builds only; run by `scripts/screenshot.sh`). It never creates a menu bar item, so a
 /// running copy of the app is left alone.
 @MainActor
-func renderScreenshots(into directory: URL, height: CGFloat = 800) throws {
+func renderScreenshots(into directory: URL, height: CGFloat = 1_030) throws {
     NSApplication.shared.setActivationPolicy(.prohibited)
     try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
     let now = Date()
