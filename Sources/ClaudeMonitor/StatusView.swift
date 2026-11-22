@@ -3,18 +3,23 @@ import SwiftUI
 
 struct StatusView: View {
     @ObservedObject var model: MonitorModel
+    @ObservedObject var updater: Updater
     /// The popover's height; screenshots use a taller one so every section shows.
     var height: CGFloat = 640
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
             header
+            if updater.showsBanner || updater.phase == .downloading || updater.message != nil {
+                updateBanner
+            }
             Divider()
             ScrollView {
                 VStack(alignment: .leading, spacing: 16) {
                     if let s = model.snapshot {
                         hardware(s)
-                        sessions(s)
+                        sessions(s, agent: .claude)
+                        if s.codexInstalled { sessions(s, agent: .codex) }
                         if !s.leftovers.isEmpty { leftovers(s) }
                         if !s.services.isEmpty { services(s) }
                         worktrees
@@ -74,6 +79,53 @@ struct StatusView: View {
         .padding(14)
     }
 
+    // MARK: Updates
+
+    private var updateBanner: some View {
+        HStack(alignment: .firstTextBaseline, spacing: 8) {
+            Image(systemName: "arrow.down.circle.fill").foregroundStyle(.blue)
+            VStack(alignment: .leading, spacing: 4) {
+                if let u = updater.available, updater.showsBanner {
+                    Text("Claude Monitor \(u.version) is available").fontWeight(.medium)
+                    if let current = updater.currentVersion {
+                        Text("You have \(current)." + (u.packageBytes.map { " The installer is \(Format.bytes($0))." } ?? ""))
+                            .font(.caption).foregroundStyle(.secondary)
+                    }
+                }
+                if let m = updater.message {
+                    Text(m).font(.caption).foregroundStyle(.primary).fixedSize(horizontal: false, vertical: true)
+                }
+                if updater.showsBanner {
+                    HStack(spacing: 8) {
+                        switch updater.phase {
+                        case .downloading:
+                            ProgressView().controlSize(.mini)
+                            Text("Downloading and verifying…").font(.caption).foregroundStyle(.secondary)
+                        default:
+                            Button("Download and Install") { updater.downloadAndInstall() }
+                                .help("Downloads the installer, checks that Apple notarized it and that it's signed by this "
+                                      + "app's developer, then opens it in Installer.")
+                            Button("What's New") { updater.openReleaseNotes() }
+                        }
+                    }
+                    .controlSize(.small)
+                }
+            }
+            Spacer(minLength: 0)
+            Button {
+                if updater.showsBanner { updater.dismiss() } else { updater.dismissMessage() }
+            } label: {
+                Image(systemName: "xmark.circle.fill")
+            }
+            .buttonStyle(.plain)
+            .foregroundStyle(.secondary)
+            .help(updater.showsBanner ? "Hide until the next version" : "Dismiss")
+            .disabled(updater.phase == .downloading)
+        }
+        .font(.callout)
+        .padding(.horizontal, 14).padding(.bottom, 10)
+    }
+
     // MARK: Hardware
 
     private func hardware(_ s: Snapshot) -> some View {
@@ -94,23 +146,25 @@ struct StatusView: View {
 
     // MARK: Sessions
 
-    private func sessions(_ s: Snapshot) -> some View {
-        let counts = Dictionary(grouping: s.sessions, by: { $0.usage.record.status.label }).mapValues(\.count)
+    private func sessions(_ s: Snapshot, agent: Agent) -> some View {
+        let reports = s.sessions(of: agent)
+        let counts = Dictionary(grouping: reports, by: { $0.usage.record.status.label }).mapValues(\.count)
         let order = ["waiting", "busy", "shell", "idle"]
         let summary = order.compactMap { k in counts[k].map { "\($0) \(k)" } }.joined(separator: " · ")
         return VStack(alignment: .leading, spacing: 6) {
             HStack(alignment: .firstTextBaseline) {
-                sectionTitle("Claude sessions (\(s.sessions.count))")
+                sectionTitle("\(agent.sessionNoun)s (\(reports.count))")
                 Spacer()
                 Text(summary).font(.caption).foregroundStyle(.secondary)
             }
-            if s.sessions.isEmpty {
-                Text("No running Claude Code sessions.").font(.callout).foregroundStyle(.secondary)
+            if reports.isEmpty {
+                Text(agent == .claude ? "No running Claude Code sessions." : "No open Codex threads.")
+                    .font(.callout).foregroundStyle(.secondary)
             }
-            ForEach(s.sessions, id: \.usage.process.pid) { r in
+            ForEach(reports, id: \.usage.key) { r in
                 SessionRow(report: r, now: s.takenAt, model: model,
-                           isExpanded: model.expandedSessions.contains(r.usage.process.pid)) {
-                    model.toggleExpanded(r.usage.process.pid)
+                           isExpanded: model.expandedSessions.contains(r.usage.key)) {
+                    model.toggleExpanded(r.usage.key)
                 }
             }
         }
@@ -234,7 +288,7 @@ struct StatusView: View {
 
     private func outside(_ s: Snapshot) -> some View {
         VStack(alignment: .leading, spacing: 6) {
-            sectionTitle("Heaviest outside Claude")
+            sectionTitle("Heaviest outside sessions")
             Grid(alignment: .leading, horizontalSpacing: 10, verticalSpacing: 4) {
                 ForEach(s.otherGroups, id: \.name) { g in
                     GridRow {
@@ -256,6 +310,17 @@ struct StatusView: View {
             if let s = model.snapshot {
                 Text("Updated \(s.takenAt.formatted(date: .omitted, time: .standard))")
                     .font(.caption).foregroundStyle(.secondary)
+            }
+            if updater.isEnabled, let v = updater.currentVersion {
+                if updater.phase == .checking {
+                    ProgressView().controlSize(.mini)
+                } else {
+                    Button { updater.check(userInitiated: true) } label: {
+                        Text("v\(v)").font(.caption).foregroundStyle(.secondary)
+                    }
+                    .buttonStyle(.plain)
+                    .help("Check for updates")
+                }
             }
             Spacer()
             Toggle("Launch at login", isOn: Binding(get: { model.launchAtLogin },
@@ -340,18 +405,27 @@ struct SessionRow: View {
         .padding(.vertical, 4)
         .contextMenu {
             Button("Reveal Folder in Finder") { model.revealFolder(u.record.cwd) }.disabled(u.record.cwd == nil)
-            Button("Copy PID (\(u.process.pid))") { model.copy("\(u.process.pid)") }
+            if u.ownsProcess {
+                Button("Copy PID (\(u.process.pid))") { model.copy("\(u.process.pid)") }
+            } else if let id = u.record.sessionId {
+                Button("Copy Thread ID") { model.copy(id) }
+            }
             if let cmd = model.resumeCommand(u.record) {
                 Button("Copy Resume Command") { model.copy(cmd) }
             }
-            Divider()
-            Button("End Session…") { model.confirmTerminate(u) }
+            // A Codex thread's process hosts other threads (and the app's own server): close
+            // threads in Codex instead.
+            if u.record.agent == .claude {
+                Divider()
+                Button("End Session…") { model.confirmTerminate(u) }
+            }
         }
     }
 
     private var subtitle: String {
         var parts: [String] = []
         if let cwd = u.record.cwd { parts.append(Format.path(cwd)) }
+        if u.record.subagentCount > 0 { parts.append(TextReport.subagents(u.record.subagentCount)) }
         if let age = report.statusAge { parts.append("\(u.record.status.label) \(Format.duration(age))") }
         if report.isStale { parts.append("stale") }
         if let top = u.topChild, top.cpuPercent >= 10 { parts.append("\(ProcessKind.label(top)) \(Format.cores(top.cores))") }

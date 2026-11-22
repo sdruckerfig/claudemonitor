@@ -1,9 +1,10 @@
 import Foundation
 
-/// A live Claude session plus every process it is responsible for.
+/// A live session (Claude Code, or a Codex thread) plus every process it is responsible for.
 public struct SessionUsage: Equatable, Sendable {
     public let record: SessionRecord
-    /// The `claude` process itself.
+    /// The `claude` process itself; for Codex, the `codex` process hosting the thread, which may
+    /// host other threads too and so isn't counted in the totals.
     public let process: ProcessRow
     /// Processes started by the session (excluding `process`), heaviest CPU first.
     /// Includes detached background jobs that were re-parented to launchd.
@@ -11,8 +12,11 @@ public struct SessionUsage: Equatable, Sendable {
     /// Pids in `descendants` that are no longer in the session's process tree.
     public let detachedPids: Set<Int32>
 
-    public var totalCores: Double { process.cores + descendants.reduce(0) { $0 + $1.cores } }
-    public var totalRSSBytes: Int64 { process.rssBytes + descendants.reduce(0) { $0 + $1.rssBytes } }
+    /// The session's own process is `process` (Claude). A Codex host is shared.
+    public var ownsProcess: Bool { record.agent == .claude }
+    public var key: String { record.key }
+    public var totalCores: Double { (ownsProcess ? process.cores : 0) + descendants.reduce(0) { $0 + $1.cores } }
+    public var totalRSSBytes: Int64 { (ownsProcess ? process.rssBytes : 0) + descendants.reduce(0) { $0 + $1.rssBytes } }
     public var childCores: Double { descendants.reduce(0) { $0 + $1.cores } }
     public var topChild: ProcessRow? { descendants.first }
 }
@@ -27,12 +31,12 @@ public struct ProcessGroup: Equatable, Sendable {
 
 public struct Attribution: Sendable {
     public let sessions: [SessionUsage]
-    /// Processes launched by Claude sessions that have since exited.
+    /// Processes launched by Claude sessions or Codex threads that have since closed.
     public let orphans: [ProcessRow]
     /// `orphans` as trees: each root (the topmost process with evidence of a closed session) and
     /// every pid in its tree, root first.
     public let orphanTrees: [(root: Int32, pids: [Int32])]
-    /// Everything not attributable to Claude.
+    /// Everything not attributable to a session.
     public let other: [ProcessRow]
 
     public static func build(processes: [ProcessRow], records: [SessionRecord]) -> Attribution {
@@ -41,7 +45,16 @@ public struct Attribution: Sendable {
         for p in processes where p.pid != p.ppid { children[p.ppid, default: []].append(p.pid) }
 
         // A status file can outlive its process, and its pid can be reused by something else.
-        let live = records.filter { r in byPid[r.pid].map(isClaude) ?? false }
+        let live = records.filter { r in
+            guard let p = byPid[r.pid] else { return false }
+            switch r.agent {
+            case .claude: return isClaude(p)
+            case .codex: return CodexSessions.isCodex(p)
+            }
+        }
+        let claudeLive = live.filter { $0.agent == .claude }
+        let codexLive = live.filter { $0.agent == .codex }
+        // Walks stop at every session's process: a codex a Claude session started hosts its own threads.
         let sessionPids = Set(live.map(\.pid))
         var claimed = sessionPids
 
@@ -60,37 +73,59 @@ public struct Attribution: Sendable {
             return out
         }
 
-        var treePids: [Int32: [Int32]] = [:]
-        for r in live { treePids[r.pid] = collect(from: children[r.pid] ?? []) }
+        var treePids: [String: [Int32]] = [:]
+        for r in claudeLive { treePids[r.key] = collect(from: children[r.pid] ?? []) }
 
         // Background jobs a session detached (nohup / reparented to launchd) still name the
         // session: in their environment, or in their command line via the scratchpad path.
-        var detached: [Int32: [Int32]] = [:]
-        for r in live {
+        var detached: [String: [Int32]] = [:]
+        for r in claudeLive {
             guard let session = byPid[r.pid] else { continue }
             let roots = processes.filter { !claimed.contains($0.pid) && started($0, by: r, process: session) }.map(\.pid)
-            detached[r.pid] = collect(from: roots)
+            detached[r.key] = collect(from: roots)
+        }
+
+        // A Codex thread's processes are the ones its environment (or a command line naming its
+        // shell snapshot) ties to it, and what they started. Not the host's whole tree: the host
+        // serves every thread, and its MCP servers and helpers belong to none of them.
+        func descends(_ pid: Int32, from ancestor: Int32) -> Bool {
+            var cur = pid
+            var hops = 0
+            while let p = byPid[cur], p.ppid > 1, hops < 64 {
+                if p.ppid == ancestor { return true }
+                cur = p.ppid
+                hops += 1
+            }
+            return false
+        }
+        for r in codexLive {
+            let roots = processes.filter { !claimed.contains($0.pid) && started($0, byCodex: r) }.map(\.pid)
+            let own = collect(from: roots)
+            treePids[r.key] = own.filter { descends($0, from: r.pid) }
+            detached[r.key] = own.filter { !descends($0, from: r.pid) }
         }
 
         // What closed sessions left behind. A root is the topmost process with that evidence:
         // its parent has none (usually it's launchd, after the session's shell exited).
         // Claude processes, interactive shells and tmux and the like are never part of a leftover.
         /// Something that started `p` is still running: a claude process without a session file
-        /// (`claude -p`), named by CLAUDE_PID or above it in the tree, or an app it runs inside.
+        /// (`claude -p`), named by CLAUDE_PID or above it in the tree, a codex process above it
+        /// (one that may still be serving the thread), or an app it runs inside.
         func hasLiveOwner(_ p: ProcessRow) -> Bool {
             if let cp = p.details.claudePid, let owner = byPid[cp], isClaude(owner),
                owner.elapsedSeconds >= p.elapsedSeconds { return true }
             var cur = p
             var hops = 0
             while let parent = byPid[cur.ppid], parent.pid > 1, hops < 64 {
-                if isClaude(parent) || ProcessKind.isAppOrSystem(parent) { return true }
+                if isClaude(parent) || CodexSessions.isCodex(parent) || ProcessKind.isAppOrSystem(parent) { return true }
                 cur = parent
                 hops += 1
             }
             return false
         }
         let candidates = Set(processes.filter { p in
-            !claimed.contains(p.pid) && looksClaudeLaunched(p) && !isClaude(p) && !ProcessKind.isBoundary(p) && !hasLiveOwner(p)
+            !claimed.contains(p.pid) && (looksClaudeLaunched(p) || looksCodexLaunched(p)) && !isClaude(p)
+                && !CodexSessions.isCodex(p) && !ProcessKind.isBoundary(p) && !hasLiveOwner(p)
         }.map(\.pid))
         let orphanRoots = candidates.filter { pid in byPid[pid].map { !candidates.contains($0.ppid) } ?? false }.sorted()
         var orphanTrees: [(root: Int32, pids: [Int32])] = []
@@ -102,13 +137,15 @@ public struct Attribution: Sendable {
 
         let sessions = live.compactMap { r -> SessionUsage? in
             guard let proc = byPid[r.pid] else { return nil }
-            let det = detached[r.pid] ?? []
-            let rows = ((treePids[r.pid] ?? []) + det).compactMap { byPid[$0] }
+            let det = detached[r.key] ?? []
+            let rows = ((treePids[r.key] ?? []) + det).compactMap { byPid[$0] }
             return SessionUsage(record: r, process: proc,
                                 descendants: rows.sorted(by: heavierFirst),
                                 detachedPids: Set(det))
         }
-        let other = processes.filter { !claimed.contains($0.pid) }
+        // A Codex host isn't charged to any one thread, so it stays among everything else.
+        let hosts = Set(codexLive.map(\.pid)).subtracting(claudeLive.map(\.pid))
+        let other = processes.filter { !claimed.contains($0.pid) || hosts.contains($0.pid) }
         return Attribution(sessions: sessions, orphans: orphans.sorted(by: heavierFirst), orphanTrees: orphanTrees, other: other)
     }
 
@@ -124,6 +161,15 @@ public struct Attribution: Sendable {
         return p.details.claudePid == s.pid && s.elapsedSeconds >= p.elapsedSeconds
     }
 
+    /// True when `p` was started by the live Codex thread `r` (or a subagent folded into it): its
+    /// environment names one of its threads, or its command line runs one of their shell
+    /// snapshots. Apps are never matched by environment, as with Claude.
+    static func started(_ p: ProcessRow, byCodex r: SessionRecord) -> Bool {
+        if let t = p.details.codexThreadId, r.threadIds.contains(t), !ProcessKind.isAppOrSystem(p) { return true }
+        guard p.args.contains("/shell_snapshots/") else { return false }
+        return r.threadIds.contains { p.args.contains("/shell_snapshots/\($0)") }
+    }
+
     public static func isClaude(_ p: ProcessRow) -> Bool {
         if p.name == "claude" { return true }
         // npm installs run as `node …/bin/claude`.
@@ -137,6 +183,13 @@ public struct Attribution: Sendable {
         if p.details.hasClaudeEnvironment && !ProcessKind.isAppOrSystem(p) { return true }
         return p.args.contains("/.claude/shell-snapshots/") ||
             p.args.range(of: #"/claude-\d+/"#, options: .regularExpression) != nil
+    }
+
+    /// Started by a Codex thread: its environment says so (apps excepted), or its command line
+    /// runs a Codex shell snapshot.
+    static func looksCodexLaunched(_ p: ProcessRow) -> Bool {
+        if p.details.hasCodexEnvironment && !ProcessKind.isAppOrSystem(p) { return true }
+        return p.args.contains("/.codex/shell_snapshots/")
     }
 
     static func heavierFirst(_ a: ProcessRow, _ b: ProcessRow) -> Bool {

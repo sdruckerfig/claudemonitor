@@ -6,7 +6,9 @@ import SwiftUI
 /// (debug builds only; run by `scripts/screenshot.sh`). It never creates a menu bar item, so a
 /// running copy of the app is left alone.
 @MainActor
-func renderScreenshots(into directory: URL, height: CGFloat = 1_030) throws {
+/// With `CLAUDEMONITOR_DEMO_UPDATE` set to a version, the update banner shows too (for checking it,
+/// not for the README).
+func renderScreenshots(into directory: URL, height: CGFloat = 1_150) throws {
     NSApplication.shared.setActivationPolicy(.prohibited)
     try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
     let now = Date()
@@ -15,7 +17,9 @@ func renderScreenshots(into directory: URL, height: CGFloat = 1_030) throws {
         model.showDemo(now: now)
         let size = NSSize(width: 480, height: height)
         let look = NSAppearance(named: appearance)
-        let hosting = NSHostingView(rootView: StatusView(model: model, height: height)
+        let updater = Updater()
+        if let v = ProcessInfo.processInfo.environment["CLAUDEMONITOR_DEMO_UPDATE"] { updater.showDemo(version: v) }
+        let hosting = NSHostingView(rootView: StatusView(model: model, updater: updater, height: height)
             .background(Color(nsColor: .windowBackgroundColor)))
         hosting.frame = NSRect(origin: .zero, size: size)
         hosting.appearance = look

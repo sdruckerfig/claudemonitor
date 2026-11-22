@@ -11,6 +11,7 @@ let usage = """
 usage: ClaudeMonitor                              run the menu bar app
        ClaudeMonitor --print                      print one health snapshot and exit
        ClaudeMonitor --worktrees                  list reclaimable worktrees and exit (never deletes)
+       ClaudeMonitor --check-updates              ask GitHub for a newer version and exit (never installs)
        ClaudeMonitor --login-item [on|off|status] manage launch at login (run from inside the .app)
        ClaudeMonitor --version
        ClaudeMonitor --help
@@ -44,7 +45,7 @@ do {
         let arg = arguments[i]
         let next = arguments.indices.contains(i + 1) ? arguments[i + 1] : nil
         switch arg {
-        case "--print", "--worktrees", "--version":
+        case "--print", "--worktrees", "--version", "--check-updates":
             modes.append(arg)
         case "--help", "-h":
             modes.append("--help")
@@ -100,6 +101,30 @@ case "--worktrees"?:
     // Lists reclaimable worktrees; never deletes.
     print(TextReport.render(WorktreeScanner().scan()))
     exit(0)
+
+case "--check-updates"?:
+    // Reports whether a newer release exists; downloading and installing happen in the app.
+    let current = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String
+    let done = DispatchSemaphore(value: 0)
+    nonisolated(unsafe) var result: Result<UpdateCheck.Outcome, UpdateCheck.Failure> = .failure(.init("no answer"))
+    Task.detached {
+        // An unbundled build has no version: compare against 0 to show the latest release.
+        result = await UpdateCheck.fetch(current: current ?? "0")
+        done.signal()
+    }
+    done.wait()
+    switch result {
+    case .success(.upToDate(let latest)):
+        print("Up to date: this is \(current ?? "an unbundled build"), the latest release is \(latest).")
+        exit(0)
+    case .success(.available(let u)):
+        print("Claude Monitor \(u.version) is available (this is \(current ?? "an unbundled build")).")
+        print("  Release:  \(u.pageURL.absoluteString)")
+        print("  Package:  \(u.packageURL.absoluteString)" + (u.packageBytes.map { " (\(Format.bytes($0)))" } ?? ""))
+        exit(0)
+    case .failure(let why):
+        fail("couldn't check for updates: \(why)")
+    }
 
 case "--login-item"?:
     // Must be run from inside the installed .app bundle; used by install.sh and uninstall.sh.

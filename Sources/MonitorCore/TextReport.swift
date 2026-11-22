@@ -10,21 +10,27 @@ public enum TextReport {
             lines.append("  \(dot(m.level)) \(m.title.padding(toLength: 8, withPad: " ", startingAt: 0)) \(m.value)")
         }
 
-        let counts = Dictionary(grouping: s.sessions, by: { $0.usage.record.status.label }).mapValues(\.count)
-        let summary = counts.sorted { $0.key < $1.key }.map { "\($0.value) \($0.key)" }.joined(separator: ", ")
-        lines.append("")
-        lines.append("Claude sessions: \(s.sessions.count)" + (summary.isEmpty ? "" : " (\(summary))"))
-        for r in s.sessions {
-            let u = r.usage
-            let age = r.statusAge.map { " \(Format.duration($0))" } ?? ""
-            var line = "  \(dot(r.level)) \(u.record.name) [\(u.record.status.label)\(age)\(r.isStale ? ", stale" : "")]"
-            line += "  \(Format.cores(u.totalCores)), \(Format.bytes(u.totalRSSBytes)), pid \(u.process.pid)"
-            if let cwd = u.record.cwd { line += "  \(Format.path(cwd))" }
-            lines.append(line)
-            for why in r.reasons { lines.append("      ! \(why)") }
-            for p in u.descendants.prefix(3) where p.cpuPercent >= 5 {
-                let det = u.detachedPids.contains(p.pid) ? " (detached)" : ""
-                lines.append("      \(ProcessKind.label(p)): \(Format.cores(p.cores)), \(Format.bytes(p.rssBytes))\(det)")
+        for agent in [Agent.claude, .codex] {
+            let reports = s.sessions(of: agent)
+            if agent == .codex && reports.isEmpty && !s.codexInstalled { continue }
+            let counts = Dictionary(grouping: reports, by: { $0.usage.record.status.label }).mapValues(\.count)
+            let summary = counts.sorted { $0.key < $1.key }.map { "\($0.value) \($0.key)" }.joined(separator: ", ")
+            lines.append("")
+            lines.append("\(agent.sessionNoun)s: \(reports.count)" + (summary.isEmpty ? "" : " (\(summary))"))
+            for r in reports {
+                let u = r.usage
+                let age = r.statusAge.map { " \(Format.duration($0))" } ?? ""
+                var line = "  \(dot(r.level)) \(u.record.name) [\(u.record.status.label)\(age)\(r.isStale ? ", stale" : "")]"
+                line += "  \(Format.cores(u.totalCores)), \(Format.bytes(u.totalRSSBytes)), "
+                line += u.ownsProcess ? "pid \(u.process.pid)" : "in \(u.process.name) pid \(u.process.pid)"
+                if u.record.subagentCount > 0 { line += ", \(subagents(u.record.subagentCount))" }
+                if let cwd = u.record.cwd { line += "  \(Format.path(cwd))" }
+                lines.append(line)
+                for why in r.reasons { lines.append("      ! \(why)") }
+                for p in u.descendants.prefix(3) where p.cpuPercent >= 5 {
+                    let det = u.detachedPids.contains(p.pid) ? " (detached)" : ""
+                    lines.append("      \(ProcessKind.label(p)): \(Format.cores(p.cores)), \(Format.bytes(p.rssBytes))\(det)")
+                }
             }
         }
 
@@ -45,7 +51,7 @@ public enum TextReport {
 
         if !s.otherGroups.isEmpty {
             lines.append("")
-            lines.append("Heaviest outside Claude:")
+            lines.append("Heaviest outside sessions:")
             for g in s.otherGroups {
                 lines.append("  \(g.name) ×\(g.count): \(Format.cores(g.cores)), \(Format.bytes(g.rssBytes))")
             }
@@ -65,6 +71,8 @@ public enum TextReport {
         }
         return lines.joined(separator: "\n")
     }
+
+    public static func subagents(_ n: Int) -> String { n == 1 ? "1 subagent" : "\(n) subagents" }
 
     static func job(_ j: ProcessJob) -> String {
         var line = "  \(j.title)  \(Format.cores(j.totalCores)), \(Format.bytes(j.totalRSSBytes)), "

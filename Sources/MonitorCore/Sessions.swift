@@ -25,9 +25,35 @@ public enum SessionStatus: Equatable, Sendable {
     }
 }
 
-/// A running session's status file: `~/.claude/sessions/<pid>.json`.
+/// Which coding agent a session belongs to.
+public enum Agent: String, Equatable, Hashable, Sendable {
+    case claude, codex
+
+    /// "Claude", "Codex".
+    public var displayName: String {
+        switch self {
+        case .claude: return "Claude"
+        case .codex: return "Codex"
+        }
+    }
+
+    /// What a session is called: "Claude session", "Codex thread".
+    public var sessionNoun: String {
+        switch self {
+        case .claude: return "Claude session"
+        case .codex: return "Codex thread"
+        }
+    }
+}
+
+/// A running session. For Claude Code, its status file: `~/.claude/sessions/<pid>.json`.
 /// The format is internal to Claude Code, so every field except pid is optional here.
+/// For Codex, a loaded thread (see `CodexSessions`): `pid` is the codex process hosting it, which
+/// may host other threads too, and `sessionId` is the thread id.
 public struct SessionRecord: Equatable, Sendable {
+    public let agent: Agent
+    /// Claude: the claude process. Codex: the codex process the thread is loaded in (an app server
+    /// can host many threads, so this pid is not the session's own).
     public let pid: Int32
     public let sessionId: String?
     public let name: String
@@ -36,9 +62,13 @@ public struct SessionRecord: Equatable, Sendable {
     public let statusUpdatedAt: Date?
     public let startedAt: Date?
     public let waitingFor: String?
+    /// Codex: the thread and the subagent threads it spawned that are loaded too. Processes
+    /// whose `CODEX_THREAD_ID` is one of these are the session's. Empty for Claude.
+    public let threadIds: Set<String>
 
-    public init(pid: Int32, sessionId: String?, name: String, cwd: String?, status: SessionStatus,
-                statusUpdatedAt: Date?, startedAt: Date?, waitingFor: String?) {
+    public init(agent: Agent = .claude, pid: Int32, sessionId: String?, name: String, cwd: String?, status: SessionStatus,
+                statusUpdatedAt: Date?, startedAt: Date?, waitingFor: String?, threadIds: Set<String> = []) {
+        self.agent = agent
         self.pid = pid
         self.sessionId = sessionId
         self.name = name
@@ -47,6 +77,33 @@ public struct SessionRecord: Equatable, Sendable {
         self.statusUpdatedAt = statusUpdatedAt
         self.startedAt = startedAt
         self.waitingFor = waitingFor
+        self.threadIds = threadIds
+    }
+
+    /// Identifies the session across snapshots. Several Codex threads can share one pid.
+    public var key: String {
+        switch agent {
+        case .claude: return "claude:\(pid)"
+        case .codex: return "codex:\(sessionId ?? "pid \(pid)")"
+        }
+    }
+
+    /// Codex subagent threads loaded alongside this one.
+    public var subagentCount: Int { max(threadIds.count - 1, 0) }
+
+    /// The command that resumes this session later, run from its folder.
+    public var resumeCommand: String? {
+        guard let id = sessionId, !id.isEmpty else { return nil }
+        let cd = cwd.map { "cd \(Self.shellQuote($0)) && " } ?? ""
+        switch agent {
+        case .claude: return "\(cd)claude --resume \(id)"
+        case .codex: return "\(cd)codex resume \(id)"
+        }
+    }
+
+    static func shellQuote(_ s: String) -> String {
+        s.allSatisfy { $0.isLetter || $0.isNumber || "/._-~".contains($0) }
+            ? s : "'" + s.replacingOccurrences(of: "'", with: "'\\''") + "'"
     }
 }
 

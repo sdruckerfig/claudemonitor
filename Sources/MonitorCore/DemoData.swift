@@ -18,11 +18,11 @@ public enum DemoData {
         let code = home + "/code"
         var rows: [ProcessRow] = []
         func add(_ pid: Int32, _ ppid: Int32, cpu: Double, mb: Int64, minutes: Int, _ path: String, _ args: String,
-                 ports: [UInt16] = [], cwd: String? = nil, session: String? = nil) {
+                 ports: [UInt16] = [], cwd: String? = nil, session: String? = nil, codexThread: String? = nil) {
             rows.append(ProcessRow(pid: pid, ppid: ppid, cpuPercent: cpu, rssKB: mb * 1024, elapsedSeconds: minutes * 60,
                                    state: "S", executablePath: path, args: args,
                                    details: ProcessDetails(ownedByUser: true, cwd: cwd, listeningPorts: ports,
-                                                           claudeSessionId: session)))
+                                                           claudeSessionId: session, codexThreadId: codexThread)))
         }
         let claude = "/usr/local/bin/claude"
         let node = "/opt/homebrew/bin/node"
@@ -37,6 +37,13 @@ public enum DemoData {
         add(4320, 4103, cpu: 2, mb: 210, minutes: 250, "/opt/homebrew/bin/postgres", "postgres -D /opt/homebrew/var/postgresql",
             ports: [5432], cwd: code + "/api")
         add(4104, 903, cpu: 0.1, mb: 310, minutes: 4_400, claude, "claude")
+
+        // A Codex thread in the Codex app's server; its subagent is running the test suite.
+        let codexServer = "/Applications/Codex.app/Contents/Resources/codex"
+        add(4500, 1, cpu: 3, mb: 380, minutes: 300, codexServer, codexServer + " app-server")
+        add(4510, 4500, cpu: 0, mb: 6, minutes: 6, "/bin/zsh", "/bin/zsh -lc pytest -n 4", codexThread: "01a1f0c3-demo-sub")
+        add(4511, 4510, cpu: 92, mb: 640, minutes: 6, "/opt/homebrew/bin/python3", "python3 -m pytest -n 4",
+            cwd: code + "/ml-pipeline", codexThread: "01a1f0c3-demo-sub")
 
         // Left behind by sessions that have since closed: a dev server found by its command
         // line, and a static file server found by its environment.
@@ -75,8 +82,12 @@ public enum DemoData {
                           status: .idle, statusUpdatedAt: ago(2 * 3600), startedAt: ago(260 * 60), waitingFor: nil),
             SessionRecord(pid: 4104, sessionId: "c4a85d39-demo-stale", name: "Docs cleanup", cwd: code + "/docs",
                           status: .idle, statusUpdatedAt: ago(3 * 86400), startedAt: ago(4_400 * 60), waitingFor: nil),
+            SessionRecord(agent: .codex, pid: 4500, sessionId: "01a1f0c2-demo-codex", name: "Migrate the feature store",
+                          cwd: code + "/ml-pipeline", status: .busy, statusUpdatedAt: ago(8), startedAt: ago(300 * 60),
+                          waitingFor: nil, threadIds: ["01a1f0c2-demo-codex", "01a1f0c3-demo-sub"]),
         ]
-        return Snapshot.assemble(system: system, processes: rows, records: records, launchdJobs: [], now: now)
+        return Snapshot.assemble(system: system, processes: rows, records: records, launchdJobs: [], now: now,
+                                 codexInstalled: true)
     }
 
     public static func worktreeScan(now: Date, home: String = NSHomeDirectory()) -> WorktreeScan {

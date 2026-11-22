@@ -24,7 +24,8 @@ final class MonitorModel: ObservableObject {
     @Published private(set) var stoppingJobs: Set<Int32> = []
 
     // View state lives here: SwiftUI's @State is a macro that Command Line Tools cannot expand.
-    @Published var expandedSessions: Set<Int32> = []
+    /// Expanded sessions, by `SessionRecord.key` (Codex threads can share a pid).
+    @Published var expandedSessions: Set<String> = []
     @Published var showLeftovers = true
     @Published var showServices = false
     @Published var showWorktrees = true
@@ -117,8 +118,8 @@ final class MonitorModel: ObservableObject {
     }
     #endif
 
-    func toggleExpanded(_ pid: Int32) {
-        if expandedSessions.contains(pid) { expandedSessions.remove(pid) } else { expandedSessions.insert(pid) }
+    func toggleExpanded(_ key: String) {
+        if expandedSessions.contains(key) { expandedSessions.remove(key) } else { expandedSessions.insert(key) }
     }
 
     // MARK: Worktrees
@@ -211,15 +212,13 @@ final class MonitorModel: ObservableObject {
         NSPasteboard.general.setString(text, forType: .string)
     }
 
-    func resumeCommand(_ r: SessionRecord) -> String? {
-        guard let id = r.sessionId else { return nil }
-        let cd = r.cwd.map { "cd \(shellQuote($0)) && " } ?? ""
-        return "\(cd)claude --resume \(id)"
-    }
+    func resumeCommand(_ r: SessionRecord) -> String? { r.resumeCommand }
 
     /// Asks for confirmation, then sends SIGTERM to the session's claude process, after making
     /// sure the pid still belongs to that same process (pids are reused once a process exits).
+    /// Claude sessions only: a Codex thread's process hosts other threads, so it's never signalled.
     func confirmTerminate(_ u: SessionUsage) {
+        guard u.record.agent == .claude else { return }
         let pid = u.process.pid
         guard let snap = snapshot,
               let row = snap.sessions.first(where: { $0.usage.process.pid == pid })?.usage.process,
@@ -279,8 +278,9 @@ final class MonitorModel: ObservableObject {
         if jobs.count == 1 {
             let j = jobs[0]
             switch j.owner {
-            case .session(_, let name): info += " started by session “\(name)”, which may still be using it"
-            case .closedSession: info += " left behind by a closed Claude session"
+            case .session(_, let name, let agent):
+                info += " started by \(agent == .claude ? "session" : "Codex thread") “\(name)”, which may still be using it"
+            case .closedSession: info += " left behind by a closed Claude session or Codex thread"
             case .detached: info += " running on \(count == 1 ? "its" : "their") own (whatever started \(count == 1 ? "it" : "them") has exited)"
             case .launcher(let name): info += " started from \(name)"
             }
@@ -320,7 +320,8 @@ final class MonitorModel: ObservableObject {
                 queue.append(c.pid)
             }
         }
-        return ProcessJob(roots: [process], members: members, owner: .session(pid: u.process.pid, name: u.record.name),
+        return ProcessJob(roots: [process], members: members,
+                          owner: .session(pid: u.process.pid, name: u.record.name, agent: u.record.agent),
                           label: ProcessKind.label(process),
                           ports: Set(members.flatMap(\.details.listeningPorts)).sorted(), cwd: process.details.cwd)
     }
@@ -479,10 +480,5 @@ final class MonitorModel: ObservableObject {
         guard s.count > max else { return s }
         let half = (max - 1) / 2
         return String(s.prefix(half)) + "…" + String(s.suffix(half))
-    }
-
-    private func shellQuote(_ s: String) -> String {
-        s.allSatisfy { $0.isLetter || $0.isNumber || "/._-~".contains($0) }
-            ? s : "'" + s.replacingOccurrences(of: "'", with: "'\\''") + "'"
     }
 }

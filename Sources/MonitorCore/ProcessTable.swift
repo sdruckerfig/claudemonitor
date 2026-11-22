@@ -57,19 +57,26 @@ public struct ProcessDetails: Equatable, Sendable {
     public var claudeSessionId: String?
     /// `CLAUDE_PID` from its environment: the claude process that started it.
     public var claudePid: Int32?
+    /// `CODEX_THREAD_ID` (or, failing that, `CODEX_SESSION_ID`) from its environment. Codex sets
+    /// it for every command it runs, and everything those commands start inherits it.
+    public var codexThreadId: String?
 
     public init(ownedByUser: Bool = false, imagePath: String? = nil, cwd: String? = nil,
-                listeningPorts: [UInt16] = [], claudeSessionId: String? = nil, claudePid: Int32? = nil) {
+                listeningPorts: [UInt16] = [], claudeSessionId: String? = nil, claudePid: Int32? = nil,
+                codexThreadId: String? = nil) {
         self.ownedByUser = ownedByUser
         self.imagePath = imagePath
         self.cwd = cwd
         self.listeningPorts = listeningPorts
         self.claudeSessionId = claudeSessionId
         self.claudePid = claudePid
+        self.codexThreadId = codexThreadId
     }
 
     /// Its environment says a Claude session started it.
     public var hasClaudeEnvironment: Bool { claudeSessionId != nil || claudePid != nil }
+    /// Its environment says a Codex thread started it.
+    public var hasCodexEnvironment: Bool { codexThreadId != nil }
 }
 
 public enum ProcessTable {

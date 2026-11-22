@@ -110,7 +110,8 @@ public final class WorktreeScanner: @unchecked Sendable {
         // worktree remove refuses edited files, but not new commits).
         let last = try liveContext(item.path)
         for path in Set([Self.realPath(wt.path), wt.path]) {
-            if let why = Worktrees.usage(of: path, processes: last.processes, cwds: last.cwds, sessions: last.sessions) {
+            if let why = Worktrees.usage(of: path, processes: last.processes, cwds: last.cwds, sessions: last.sessions,
+                                         codexThreads: last.codexThreads) {
                 throw WorktreeError.noLongerSafe(item.path, why)
             }
         }
@@ -224,7 +225,8 @@ public final class WorktreeScanner: @unchecked Sendable {
 
         let real = Self.realPath(wt.path)
         for path in Set([real, wt.path]) {
-            if let why = Worktrees.usage(of: path, processes: context.processes, cwds: context.cwds, sessions: context.sessions) {
+            if let why = Worktrees.usage(of: path, processes: context.processes, cwds: context.cwds, sessions: context.sessions,
+                                         codexThreads: context.codexThreads) {
                 return (.inUse(why), nil)
             }
         }
@@ -837,11 +839,13 @@ public final class WorktreeScanner: @unchecked Sendable {
     }
 }
 
-/// What is running right now: processes, their working directories, open Claude sessions.
+/// What is running right now: processes, their working directories, open Claude sessions, and
+/// the Codex threads that aren't archived.
 struct LiveContext {
     let processes: [ProcessRow]
     let cwds: [Int32: String]
     let sessions: [SessionRecord]
+    var codexThreads: [CodexThread] = []
 
     struct Unavailable: Error, CustomStringConvertible {
         let description: String
@@ -850,7 +854,27 @@ struct LiveContext {
     /// Throws rather than return a partial picture: with no processes listed, every "in use"
     /// check would pass.
     static func capture() throws -> LiveContext {
-        try make(ps: Monitor.ps(ProcessTable.mainArguments), cwds: ProcessCwd.all(), sessions: SessionFiles.load())
+        var context = try make(ps: Monitor.ps(ProcessTable.mainArguments), cwds: ProcessCwd.all(), sessions: SessionFiles.load())
+        context.codexThreads = try codexThreads(processes: context.processes)
+        return context
+    }
+
+    /// Codex threads that may be using a folder: every thread not archived, and every loaded one.
+    /// Throws when that can't be known, so no worktree is offered: a loaded thread whose folder
+    /// can't be read, or a state database that exists but can't be read.
+    static func codexThreads(processes: [ProcessRow], home: URL = CodexSessions.home) throws -> [CodexThread] {
+        let live = CodexSessions.liveThreads(in: processes)
+        switch CodexState.threads(home: home, ids: Set(live.keys), unarchived: true) {
+        case .success(let threads):
+            if let unknown = live.keys.sorted().first(where: { threads[$0]?.cwd == nil }) {
+                throw Unavailable(description: "the folder of open Codex thread \(unknown) is unknown")
+            }
+            return threads.values.sorted { $0.id < $1.id }
+        case .failure(.missing) where live.isEmpty:
+            return []
+        case .failure(let why):
+            throw Unavailable(description: "\(why)")
+        }
     }
 
     static func make(ps: String, cwds: [Int32: String]?, sessions: [SessionRecord],

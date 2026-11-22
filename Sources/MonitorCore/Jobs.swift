@@ -4,14 +4,15 @@ import Foundation
 /// stopping `npm run dev` also stops the vite server under it.
 public struct ProcessJob: Equatable, Sendable, Identifiable {
     public enum Owner: Equatable, Sendable {
-        /// A live Claude session started it.
-        case session(pid: Int32, name: String)
-        /// A Claude session started it and has since closed.
+        /// A live session started it. `pid` is the session's claude process, or for Codex the
+        /// codex process hosting the thread.
+        case session(pid: Int32, name: String, agent: Agent = .claude)
+        /// A Claude session or Codex thread started it and has since closed.
         case closedSession
         /// Started outside Claude, and whatever started it has exited (it was re-parented to
         /// launchd, which doesn't manage it). Build daemons do this on purpose.
         case detached
-        /// Started outside Claude by something still running: Terminal, an editor, Codex…
+        /// Started outside any session by something still running: Terminal, an editor…
         case launcher(String)
     }
 
@@ -56,7 +57,7 @@ public struct ProcessJob: Equatable, Sendable, Identifiable {
     /// Who started it, in a few words.
     public var ownerText: String {
         switch owner {
-        case .session(_, let name): return "session “\(name)”"
+        case .session(_, let name, let agent): return agent == .claude ? "session “\(name)”" : "Codex thread “\(name)”"
         case .closedSession: return "closed session"
         case .detached: return "running on its own"
         case .launcher(let name): return "from \(name)"
@@ -78,10 +79,10 @@ public struct ProcessJob: Equatable, Sendable, Identifiable {
 }
 
 public enum Jobs {
-    /// - Returns: `leftovers`, every process tree a closed Claude session left behind, and
+    /// - Returns: `leftovers`, every process tree a closed Claude session or Codex thread left behind, and
     ///   `services`, every other job that listens on a TCP port or is a detached build daemon,
     ///   whoever started it. Neither includes apps, macOS's own processes, other users'
-    ///   processes, claude itself, interactive shells, tmux and the like, or launchd jobs.
+    ///   processes, claude or codex themselves, interactive shells, tmux and the like, or launchd jobs.
     /// - Parameter launchdJobs: pids launchd manages (`LaunchdJobs.pids()`); nil if unknown,
     ///   in which case no job outside Claude counts as detached.
     public static func build(_ a: Attribution, processes: [ProcessRow], launchdJobs: Set<Int32>?,
@@ -95,7 +96,7 @@ public enum Jobs {
         }
 
         // Which scope each pid is in: a live session's processes, a closed session's leftovers, or neither.
-        var sessionOf: [Int32: SessionUsage] = [:]
+        var sessionOf: [Int32: SessionUsage] = [:]   // pid → session (keyed by `key`: Codex threads share a host)
         for s in a.sessions { for d in s.descendants { sessionOf[d.pid] = s } }
         let otherPids = Set(a.other.map(\.pid))
 
@@ -174,14 +175,14 @@ public enum Jobs {
 
         // Servers in live sessions' trees.
         for s in a.sessions {
-            let scope: (Int32) -> Bool = { sessionOf[$0]?.process.pid == s.process.pid }
+            let scope: (Int32) -> Bool = { sessionOf[$0]?.key == s.key }
+            let owner = ProcessJob.Owner.session(pid: s.process.pid, name: s.record.name, agent: s.record.agent)
             for p in s.descendants where !p.details.listeningPorts.isEmpty && stoppable(p) {
-                add(root: top(of: p, within: scope), owner: .session(pid: s.process.pid, name: s.record.name),
-                    within: scope, require: listens)
+                add(root: top(of: p, within: scope), owner: owner, within: scope, require: listens)
             }
             // Build daemons a session detached (Gradle, Kotlin): they outlive the build on purpose.
             for p in s.descendants where s.detachedPids.contains(p.pid) && p.ppid == 1 && ProcessKind.isBuildTool(p) {
-                add(root: p, owner: .session(pid: s.process.pid, name: s.record.name), within: scope, require: { _ in true })
+                add(root: p, owner: owner, within: scope, require: { _ in true })
             }
         }
 
@@ -235,10 +236,10 @@ public enum Jobs {
     }
 
     /// Can be stopped by this app: the user's own, not launchd or this app, and not something
-    /// that is never stopped as part of a job (claude, an app or part of macOS, an interactive
-    /// shell, tmux and the like).
+    /// that is never stopped as part of a job (claude, codex, an app or part of macOS, an
+    /// interactive shell, tmux and the like).
     public static func isStoppable(_ p: ProcessRow, selfPid: Int32 = getpid()) -> Bool {
-        p.details.ownedByUser && p.pid > 1 && p.pid != selfPid && !Attribution.isClaude(p)
+        p.details.ownedByUser && p.pid > 1 && p.pid != selfPid && !Attribution.isClaude(p) && !CodexSessions.isCodex(p)
             && !ProcessKind.isAppOrSystem(p) && !ProcessKind.isBoundary(p)
     }
 

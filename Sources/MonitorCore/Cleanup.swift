@@ -10,7 +10,8 @@ public struct CleanupPlan {
     public let leftovers: [ProcessJob]
     /// Every server and build daemon, including ones live sessions or other apps started.
     public let services: [ProcessJob]
-    /// Sessions idle long enough to be marked stale.
+    /// Claude sessions idle long enough to be marked stale. Codex threads are never ended: their
+    /// host process serves other threads (and, for the apps, the app itself).
     public let staleSessions: [SessionUsage]
     /// What each stale session started that isn't already a leftover or a service.
     public let staleSessionJobs: [ProcessJob]
@@ -22,7 +23,7 @@ public struct CleanupPlan {
         takenAt = snapshot.takenAt
         leftovers = snapshot.leftovers.filter { !skipping.contains($0.id) }
         services = snapshot.services.filter { !skipping.contains($0.id) }
-        staleSessions = snapshot.sessions.filter(\.isStale).map(\.usage)
+        staleSessions = snapshot.sessions.filter { $0.isStale && $0.usage.record.agent == .claude }.map(\.usage)
         var listed = Set((leftovers + services).flatMap { $0.members.map(\.pid) })
         var extra: [ProcessJob] = []
         for u in staleSessions {
@@ -57,7 +58,8 @@ public struct CleanupPlan {
                 queue.append(c.pid)
             }
         }
-        return ProcessJob(roots: roots, members: members, owner: .session(pid: u.process.pid, name: u.record.name),
+        return ProcessJob(roots: roots, members: members,
+                          owner: .session(pid: u.process.pid, name: u.record.name, agent: u.record.agent),
                           label: ProcessKind.label(roots[0]),
                           ports: Set(members.flatMap(\.details.listeningPorts)).sorted(), cwd: roots[0].details.cwd)
     }
@@ -76,7 +78,7 @@ public struct CleanupPlan {
         let ending = Set(staleSessions.map(\.process.pid))
         return services.filter {
             switch $0.owner {
-            case .session(let pid, _): return !ending.contains(pid)
+            case .session(let pid, _, let agent): return agent != .claude || !ending.contains(pid)
             case .launcher: return true
             case .closedSession, .detached: return false
             }

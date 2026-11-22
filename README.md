@@ -4,16 +4,18 @@ A macOS menu bar app that shows:
 
 - **Hardware health rollup** (green / yellow / red): is the machine overloaded?
 - **Every running Claude Code session**: status, the CPU and memory used by everything it started, and whether it needs attention.
+- **Every open Codex thread** (the Codex app, the ChatGPT app's Codex, or the `codex` CLI): whether it's working, its subagents, and the CPU and memory of everything it started.
 - **Leftover servers and build processes**: what closed sessions left running, every dev server listening on a port, and build daemons running on their own, each with a button to stop it.
 - **Reclaimable git worktrees**: worktrees that are safe to delete, how much disk they'd free, and a button to delete them.
 - **YOLO**: one button that cleans up all of the above at once, after showing what it will do.
+- **Updates**: tells you when a new version is out, and downloads, verifies and installs it when you ask.
 
-The menu bar shows a colored dot (the hardware rollup) and the number of Claude sessions. If any session is waiting on you, it also shows `· N⏳`. Click it for details.
+The menu bar shows a colored dot (the hardware rollup) and the number of Claude sessions and Codex threads. If any session is waiting on you, it also shows `· N⏳`, and `↑` when an update is available. Click it for details.
 
 <p align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="docs/screenshot-dark.png">
-    <img src="docs/screenshot-light.png" width="480" alt="The Claude Monitor popover: a yellow hardware rollup because the CPU is oversubscribed, four Claude sessions (one waiting on you, one busy using two cores, two idle), a Next.js dev server and a static file server left behind by closed sessions with stop buttons, three servers and build daemons (vite and postgres started by sessions, a Gradle daemon running on its own), three reclaimable worktrees totaling 2.2 GB with delete buttons, and the heaviest apps outside Claude.">
+    <img src="docs/screenshot-light.png" width="480" alt="The Claude Monitor popover: a yellow hardware rollup because the CPU is oversubscribed, four Claude sessions (one waiting on you, one busy using two cores, two idle), a busy Codex thread whose subagent is running tests, a Next.js dev server and a static file server left behind by closed sessions with stop buttons, three servers and build daemons (vite and postgres started by sessions, a Gradle daemon running on its own), three reclaimable worktrees totaling 2.2 GB with delete buttons, and the heaviest apps outside any session.">
   </picture>
 </p>
 
@@ -62,6 +64,7 @@ These examples use `~/Applications`; if you installed for all users, use `/Appli
 ```sh
 ~/Applications/ClaudeMonitor.app/Contents/MacOS/ClaudeMonitor --print        # one health snapshot
 ~/Applications/ClaudeMonitor.app/Contents/MacOS/ClaudeMonitor --worktrees    # list reclaimable worktrees (never deletes)
+~/Applications/ClaudeMonitor.app/Contents/MacOS/ClaudeMonitor --check-updates  # is a newer version out? (never installs)
 ~/Applications/ClaudeMonitor.app/Contents/MacOS/ClaudeMonitor --login-item [on|off|status]
 ~/Applications/ClaudeMonitor.app/Contents/MacOS/ClaudeMonitor --version
 ~/Applications/ClaudeMonitor.app/Contents/MacOS/ClaudeMonitor --help
@@ -95,11 +98,19 @@ Sessions are read from `~/.claude/sessions/<pid>.json`. This is an internal Clau
 
 Right-click a session to reveal its folder, copy its PID, copy a `claude --resume` command, or end it (SIGTERM, with confirmation). Click a session to list the processes it started, with any ports they listen on. Right-click one to stop it and everything under it (a runaway build or test run, say), or to force-stop it.
 
+### Codex threads
+
+Codex has no session file, so an open thread is one whose writer lock, `~/.codex/thread-writer-locks/<thread id>.lock` (under `$CODEX_HOME` if set), a `codex` process holds open. That process hosts the thread: the Codex and ChatGPT apps run one server for all their threads, and the CLI hosts its own. The thread's folder, title and last activity come from Codex's state database (`~/.codex/state_<n>.sqlite`), opened read-only; if it can't be read, the thread is still listed, by id. Subagent threads are folded into the thread that spawned them ("2 subagents").
+
+Each thread is charged for the processes whose environment has its `CODEX_THREAD_ID` (or one of its subagents'), which Codex sets for every command it runs, plus whatever those started. The host itself isn't charged, since it serves every thread; it's listed with the other apps. Codex doesn't record whether a thread is waiting on you, so a thread is **busy** if it was active in the last 45 seconds and **idle** otherwise, and stale after 24 h idle like a Claude session.
+
+Right-click a thread to reveal its folder, or to copy its id or a `codex resume` command. There's no End Session for a Codex thread, and YOLO never ends one: stopping its host would stop every other thread in it, and for the apps the app's own server. Close threads in Codex. What Codex threads left running is listed and stopped like anything Claude left behind.
+
 ## Leftover servers and build processes
 
 Two sections list processes you may want to stop:
 
-- **Left behind by closed sessions**: every process tree a Claude session started and left running after it closed, such as a dev server, a `tail -f`, or a build. A process counts when its environment names a session that is no longer running, or its command line contains a Claude shell snapshot or scratchpad path. It must also have nothing still running that started it: not an open app, and not a `claude` process without a session file (`claude -p`). **Stop All** stops every one.
+- **Left behind by closed sessions**: every process tree a Claude session or Codex thread started and left running after it closed, such as a dev server, a `tail -f`, or a build. A process counts when its environment names a session that is no longer running, or its command line contains a Claude shell snapshot or scratchpad path. It must also have nothing still running that started it: not an open app, and not a `claude` process without a session file (`claude -p`). **Stop All** stops every one.
 - **Servers & build daemons**: every other process listening on a TCP port, plus build daemons running on their own after their build exited (Gradle, Kotlin, MSBuild nodes, the C# compiler server, `esbuild`, `tsc --watch` and the like). Each row says who started it: a session, the app it runs under (Terminal, an editor), or "running on its own". These may still be in use, so they're stopped one at a time.
 
 Each row is a job: the process plus everything it started, named after what it runs (`vite`, `http.server`, `Gradle daemon`), with its ports, folder, age, CPU and memory. Identical jobs with no ports are listed once ("MSBuild node ×11"). A server's job starts at the topmost process that only started it, so stopping vite also stops the `npm run dev` above it, and a `node --watch` supervisor can't restart it. Right-click a row to open its port in a browser, reveal its folder, or copy its command.
@@ -151,6 +162,14 @@ The rule settings are in `WorktreePolicy` (`Sources/MonitorCore/Worktrees.swift`
 It shows one dialog first: what it will do, which servers may be in use, and about how much memory and disk it frees. Return confirms. None of the safety rules are relaxed. Each process is checked again right before it's signalled, and a stale session is ended only if it's still idle and unchanged since the dialog opened. Every worktree goes through all the checks above, so one that is no longer safe is kept. Afterwards it scans worktrees again, since ending sessions can free more; those are listed, not deleted. You can resume an ended session with `claude --resume`.
 
 The plan is in `Sources/MonitorCore/Cleanup.swift`.
+
+## Updates
+
+A minute after launch, and then once a day, the app asks GitHub for the [latest release](https://github.com/sdruckerfig/claudemonitor/releases/latest). That one request sends nothing about you or your Mac. To check right away, click the version number in the footer. When a newer version is out, you get one macOS notification for it, a `↑` in the menu bar, and a banner at the top of the popover. Closing the banner hides it until the next version.
+
+**Download and Install** downloads the release's installer package, only from this project's GitHub release downloads, into `~/Library/Caches/io.github.sdruckerfig.claudemonitor/Updates/`. Gatekeeper must accept it as notarized by Apple and signed by the same developer team as the running app; otherwise it's deleted and nothing is opened. A copy built from source has no team to compare, so any notarized Developer ID package from the project's releases is accepted. The package then opens in Installer, which asks you to confirm (and for an administrator password to install into `/Applications`). When it finishes, the new version starts and quits the old one. If your copy is in `~/Applications`, the app first reminds you to choose **Install for me only**, so the update replaces it.
+
+Builds run straight from `swift build` never check.
 
 ## Layout
 

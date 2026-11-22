@@ -2,9 +2,10 @@ import Darwin
 import Foundation
 
 /// Reads what `ps` doesn't show, straight from the kernel: who owns each process, its real
-/// executable, its working folder, the TCP ports it listens on, and two variables from its
-/// environment (`CLAUDE_CODE_SESSION_ID`, `CLAUDE_PID`). The rest of the environment, which can
-/// hold tokens and keys, is never kept: only those two names are compared and copied.
+/// executable, its working folder, the TCP ports it listens on, and a few variables from its
+/// environment (`CLAUDE_CODE_SESSION_ID`, `CLAUDE_PID`, `CODEX_THREAD_ID`, `CODEX_SESSION_ID`).
+/// The rest of the environment, which can hold tokens and keys, is never kept: only those names
+/// are compared and copied.
 ///
 /// Apps and macOS's own processes are left alone (see `ProcessKind.isAppOrSystem`), as are
 /// other users' processes, which the kernel doesn't let us read anyway.
@@ -13,6 +14,9 @@ import Foundation
 public final class ProcessInspector {
     public static let sessionIdKey = "CLAUDE_CODE_SESSION_ID"
     public static let claudePidKey = "CLAUDE_PID"
+    public static let codexThreadIdKey = "CODEX_THREAD_ID"
+    public static let codexSessionIdKey = "CODEX_SESSION_ID"
+    static let environmentKeys: Set<String> = [sessionIdKey, claudePidKey, codexThreadIdKey, codexSessionIdKey]
 
     /// Per process: what doesn't change until it execs something else (its executable, its
     /// starting environment). A fork keeps its start time across exec, so the command line is
@@ -24,6 +28,7 @@ public final class ProcessInspector {
         let skip: Bool
         let sessionId: String?
         let claudePid: Int32?
+        let codexThreadId: String?
     }
 
     private var fixed: [Int32: Fixed] = [:]
@@ -46,10 +51,12 @@ public final class ProcessInspector {
             } else {
                 let image = Self.imagePath(row.pid)
                 let skip = ProcessKind.isAppOrSystem(path: image ?? row.executablePath, home: home)
-                let env = skip ? [:] : (Self.environment(of: row.pid, keys: [Self.sessionIdKey, Self.claudePidKey]) ?? [:])
+                let env = skip ? [:] : (Self.environment(of: row.pid, keys: Self.environmentKeys) ?? [:])
+                func value(_ key: String) -> String? { env[key].flatMap { $0.isEmpty ? nil : $0 } }
                 f = Fixed(start: info.start, args: row.args, imagePath: image, skip: skip,
-                          sessionId: env[Self.sessionIdKey].flatMap { $0.isEmpty ? nil : $0 },
-                          claudePid: env[Self.claudePidKey].flatMap { Int32($0) })
+                          sessionId: value(Self.sessionIdKey),
+                          claudePid: value(Self.claudePidKey).flatMap { Int32($0) },
+                          codexThreadId: value(Self.codexThreadIdKey) ?? value(Self.codexSessionIdKey))
                 fixed[row.pid] = f
             }
             var r = row
@@ -58,6 +65,7 @@ public final class ProcessInspector {
             guard !f.skip else { return r }
             r.details.claudeSessionId = f.sessionId
             r.details.claudePid = f.claudePid
+            r.details.codexThreadId = f.codexThreadId
             r.details.cwd = Self.cwd(row.pid)
             r.details.listeningPorts = Self.listeningPorts(row.pid)
             return r
@@ -113,6 +121,28 @@ public final class ProcessInspector {
             ports.insert(UInt16(bigEndian: UInt16(truncatingIfNeeded: tcp.tcpsi_ini.insi_lport)))
         }
         return ports.sorted()
+    }
+
+    /// Paths of the regular files `pid` has open whose path contains `fragment`. Empty if they
+    /// can't be read (another user's process, or one that has exited).
+    public static func openFiles(_ pid: Int32, containing fragment: String) -> [String] {
+        let bytes = proc_pidinfo(pid, PROC_PIDLISTFDS, 0, nil, 0)
+        guard bytes > 0 else { return [] }
+        let stride = MemoryLayout<proc_fdinfo>.stride
+        var fds = [proc_fdinfo](repeating: proc_fdinfo(), count: Int(bytes) / stride + 32)
+        let got = proc_pidinfo(pid, PROC_PIDLISTFDS, 0, &fds, Int32(fds.count * stride))
+        guard got > 0 else { return [] }
+        var out: [String] = []
+        for fd in fds.prefix(Int(got) / stride) where fd.proc_fdtype == PROX_FDTYPE_VNODE {
+            var info = vnode_fdinfowithpath()
+            let size = Int32(MemoryLayout<vnode_fdinfowithpath>.size)
+            guard proc_pidfdinfo(pid, fd.proc_fd, PROC_PIDFDVNODEPATHINFO, &info, size) == size else { continue }
+            let path = withUnsafeBytes(of: info.pvip.vip_path) { raw in
+                String(decoding: raw.prefix { $0 != 0 }, as: UTF8.self)
+            }
+            if path.contains(fragment) { out.append(path) }
+        }
+        return out
     }
 
     // MARK: Environment

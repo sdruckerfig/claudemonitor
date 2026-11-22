@@ -5,6 +5,7 @@ import SwiftUI
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
     private let model = MonitorModel()
+    private let updater = Updater()
     private var statusItem: NSStatusItem!
     private let popover = NSPopover()
 
@@ -20,14 +21,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             button.imagePosition = .imageLeading
         }
         popover.behavior = .transient
-        let hosting = NSHostingController(rootView: StatusView(model: model))
+        let hosting = NSHostingController(rootView: StatusView(model: model, updater: updater))
         hosting.sizingOptions = .preferredContentSize
         popover.contentViewController = hosting
         popover.contentSize = NSSize(width: 480, height: 640)
 
         model.onUpdate = { [weak self] in self?.updateButton() }
+        updater.onChange = { [weak self] in self?.updateButton() }
+        updater.onOpenRequest = { [weak self] in self?.showPopover() }
         updateButton()
         model.start()
+        updater.start()
     }
 
     /// One menu bar icon. The copy launched last wins (an update, or a copy installed elsewhere)
@@ -64,11 +68,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if popover.isShown {
             popover.performClose(sender)
         } else {
-            model.refresh()
-            model.refreshLoginItem()
-            popover.show(relativeTo: sender.bounds, of: sender, preferredEdge: .minY)
-            popover.contentViewController?.view.window?.makeKey()
+            showPopover()
         }
+    }
+
+    private func showPopover() {
+        guard let button = statusItem.button, !popover.isShown else { return }
+        model.refresh()
+        model.refreshLoginItem()
+        NSApp.activate(ignoringOtherApps: true)
+        popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
+        popover.contentViewController?.view.window?.makeKey()
     }
 
     private func updateButton() {
@@ -78,14 +88,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         button.image = Self.dot(level.map(LevelStyle.nsColor) ?? .tertiaryLabelColor)
         let count = snapshot?.sessions.count ?? 0
         let needsYou = snapshot?.sessions.filter { $0.usage.record.status == .waiting }.count ?? 0
-        let title = needsYou > 0 ? " \(count) · \(needsYou)⏳" : " \(count)"
+        var title = needsYou > 0 ? " \(count) · \(needsYou)⏳" : " \(count)"
+        if updater.showsBanner { title += " ↑" }
         button.attributedTitle = NSAttributedString(string: title, attributes: [
             .font: NSFont.monospacedDigitSystemFont(ofSize: NSFont.systemFontSize, weight: .medium),
         ])
 
         var tip = "Claude Monitor"
         if let s = snapshot {
-            tip = "Hardware: \(TextReport.word(s.rollup))\n\(s.sessions.count) Claude sessions"
+            tip = "Hardware: \(TextReport.word(s.rollup))\n\(s.sessions(of: .claude).count) Claude sessions"
+            if s.codexInstalled { tip += ", \(s.sessions(of: .codex).count) Codex threads" }
             for r in s.reasons { tip += "\n• \(r)" }
             if !s.leftovers.isEmpty {
                 let mem = s.leftovers.reduce(Int64(0)) { $0 + $1.totalRSSBytes }
@@ -95,6 +107,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if let w = model.worktreeScan, !w.reclaimable.isEmpty {
             tip += "\n\(w.reclaimable.count) worktrees can be deleted (about \(Format.bytes(w.totalBytes)))"
         }
+        if let u = updater.available, updater.showsBanner { tip += "\nClaude Monitor \(u.version) is available" }
         if let e = model.errorText { tip += "\n⚠︎ \(e)" }
         if let n = model.notice { tip += "\n\(n)" }
         button.toolTip = tip

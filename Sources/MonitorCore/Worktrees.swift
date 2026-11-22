@@ -241,12 +241,16 @@ public enum Worktrees {
         path.utf8.split(separator: UInt8(ascii: "/")).map { String(decoding: $0, as: UTF8.self) }
     }
 
-    /// Whether anything is using the worktree: an open Claude session, a process whose
-    /// working directory is inside it, or a process whose command line names it.
+    /// Whether anything is using the worktree: an open Claude session, a Codex thread that works
+    /// in it (loaded or not: the Codex app reopens a thread in its folder until it's archived), a
+    /// process whose working directory is inside it, or a process whose command line names it.
     public static func usage(of path: String, processes: [ProcessRow], cwds: [Int32: String],
-                             sessions: [SessionRecord]) -> String? {
+                             sessions: [SessionRecord], codexThreads: [CodexThread] = []) -> String? {
         if let s = sessions.first(where: { $0.cwd.map { contains(path, $0) } ?? false }) {
-            return "Claude session “\(s.name)” is open here"
+            return "\(s.agent.sessionNoun) “\(s.name)” is open here"
+        }
+        if let t = codexThreads.sorted(by: { $0.id < $1.id }).first(where: { $0.cwd.map { contains(path, $0) } ?? false }) {
+            return "Codex thread “\(t.title ?? t.id)” works here"
         }
         // Worktrees a session made in its own scratchpad (…/<sessionId>/scratchpad/…).
         if let s = sessions.first(where: { $0.sessionId.map { !$0.isEmpty && path.contains("/\($0)/") } ?? false }) {

@@ -6,20 +6,23 @@ public struct Snapshot: Sendable {
     public let hardware: [MetricStatus]
     /// Red/yellow/green for "is the hardware overloaded".
     public let rollup: Level
-    /// Sessions, most urgent first.
+    /// Claude sessions and Codex threads, most urgent first.
     public let sessions: [SessionReport]
+    /// Codex is used on this Mac: its threads get a section even when none is open.
+    public let codexInstalled: Bool
     /// Process trees left behind by closed sessions; servers first.
     public let leftovers: [ProcessJob]
     /// Everything else listening on a TCP port, and detached build daemons, whoever started them.
     public let services: [ProcessJob]
-    /// Heaviest non-Claude process groups.
+    /// Heaviest process groups outside any session.
     public let otherGroups: [ProcessGroup]
 
     public var reasons: [String] { hardware.compactMap(\.reason) }
+    public func sessions(of agent: Agent) -> [SessionReport] { sessions.filter { $0.usage.record.agent == agent } }
 
     /// - Parameter launchdJobs: pids launchd manages (`LaunchdJobs.pids()`); nil if unknown.
     public static func assemble(system: SystemMetrics, processes: [ProcessRow], records: [SessionRecord],
-                                launchdJobs: Set<Int32>? = nil, now: Date,
+                                launchdJobs: Set<Int32>? = nil, now: Date, codexInstalled: Bool = false,
                                 thresholds: Thresholds = Thresholds()) -> Snapshot {
         let hardware = Health.hardware(system, thresholds)
         let attribution = Attribution.build(processes: processes, records: records)
@@ -33,7 +36,8 @@ public struct Snapshot: Sendable {
             .filter { $0.cores >= 0.1 || $0.rssBytes >= 500 * 1_048_576 }
             .sorted { ($0.cores, $0.rssBytes) > ($1.cores, $1.rssBytes) }
         return Snapshot(takenAt: now, system: system, hardware: hardware, rollup: Health.rollup(hardware),
-                        sessions: reports, leftovers: jobs.leftovers, services: jobs.services,
+                        sessions: reports, codexInstalled: codexInstalled || reports.contains { $0.usage.record.agent == .codex },
+                        leftovers: jobs.leftovers, services: jobs.services,
                         otherGroups: Array(groups.prefix(6)))
     }
 
@@ -80,9 +84,10 @@ public final class Monitor: @unchecked Sendable {
         let now = Date()
         let system = sampler.sample(now: now)
         let processes = try processTable(takenAt: now)
-        let records = SessionFiles.load(from: sessionsDirectory)
+        let records = SessionFiles.load(from: sessionsDirectory) + CodexSessions.load(processes: processes, now: now)
         return Snapshot.assemble(system: system, processes: processes, records: records,
-                                 launchdJobs: LaunchdJobs.pids(), now: now, thresholds: thresholds)
+                                 launchdJobs: LaunchdJobs.pids(), now: now,
+                                 codexInstalled: CodexSessions.isInstalled(), thresholds: thresholds)
     }
 
     /// Every process, with the details `ProcessInspector` adds. `takenAt` should be read just
